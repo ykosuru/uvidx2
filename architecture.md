@@ -179,9 +179,51 @@ The Unified Indexer is a domain-aware search and retrieval system designed speci
 
 1. **Local-First Embeddings**: No OpenAI/external API required for core functionality
 2. **Domain Vocabulary as First-Class Citizen**: Aho-Corasick automaton for O(n) matching
-3. **Hybrid Search**: Combine semantic (vector) with exact (concept) matching
+3. **Three-Way Hybrid Search**: Vector + Concept + Keyword with adaptive weighting
 4. **Chunk-Based Architecture**: All content normalized to IndexableChunk
 5. **Pluggable LLM Integration**: Abstract provider pattern for multiple backends
+
+### 3.4 Three-Way Search Strategy
+
+The search system combines three complementary approaches:
+
+```
+Query: "how to implement FedIn LTR"
+                    │
+    ┌───────────────┼───────────────┐
+    ▼               ▼               ▼
+┌─────────┐   ┌──────────┐   ┌──────────┐
+│ Vector  │   │ Concept  │   │ Keyword  │
+│ Search  │   │  Search  │   │ (Grep)   │
+└────┬────┘   └────┬─────┘   └────┬─────┘
+     │             │              │
+  Semantic    Domain Terms    Exact Match
+  Similarity   (MT-103,OFAC)  "FedIn LTR"
+     │             │              │
+     └─────────────┴──────────────┘
+                   │
+           ┌───────▼───────┐
+           │ Score Fusion  │
+           │ with Adaptive │
+           │   Weighting   │
+           └───────────────┘
+```
+
+**Adaptive Keyword Weighting:**
+
+When vector similarity scores are low (technical terms, acronyms, domain jargon), 
+the system automatically boosts keyword matching:
+
+| Top Vector Score | Keyword Weight | Strategy |
+|-----------------|----------------|----------|
+| > 0.30 | 0.3 (default) | Trust semantic similarity |
+| 0.25 - 0.30 | 0.5 | Balance semantic + keyword |
+| 0.15 - 0.25 | 0.6 | Prefer keyword matches |
+| < 0.15 | 0.8 | Keyword-dominant (fallback) |
+| No results | 0.9 | Almost pure keyword search |
+
+This ensures queries like "FedIn LTR" find exact matches even when embeddings 
+don't capture the domain-specific terminology.
 
 ---
 

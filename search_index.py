@@ -81,7 +81,12 @@ def print_result(result, index: int, verbose: bool = False):
     chunk = result.chunk
     
     print(f"\n{'─' * 60}")
-    print(f"Result #{index + 1}  |  Score: {result.combined_score:.3f}  |  Type: {chunk.source_type.value.upper()}")
+    score_info = f"Score: {result.combined_score:.3f}"
+    if verbose:
+        score_info += f" (v:{result.vector_score:.3f} c:{result.concept_score:.3f} k:{result.keyword_score:.3f})"
+    print(f"Result #{index + 1}  |  {score_info}  |  Type: {chunk.source_type.value.upper()}")
+    if verbose:
+        print(f"Method: {result.retrieval_method}")
     print(f"{'─' * 60}")
     
     source_ref = chunk.source_ref

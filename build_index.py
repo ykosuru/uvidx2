@@ -305,14 +305,23 @@ Examples:
     
     # Create pipeline
     print(f"\nInitializing pipeline with '{args.embedder}' embedder...")
-    pipeline = IndexingPipeline(
-        vocabulary_data=vocab_data,
-        embedder_type=args.embedder
-    )
     
-    # Set embedder with custom dimensions if specified
-    if embedder_kwargs:
+    # For learned embedders, we need to pass dimensions_path via set_embedder
+    # So create pipeline without embedder first, then set it
+    if args.embedder in ["learned", "learned_hybrid"]:
+        pipeline = IndexingPipeline(
+            vocabulary_data=vocab_data,
+            embedder_type=None  # Set embedder after with kwargs
+        )
         pipeline.set_embedder(args.embedder, **embedder_kwargs)
+    else:
+        pipeline = IndexingPipeline(
+            vocabulary_data=vocab_data,
+            embedder_type=args.embedder
+        )
+        # Set embedder with custom dimensions if specified
+        if embedder_kwargs:
+            pipeline.set_embedder(args.embedder, **embedder_kwargs)
     
     # Report dimensions
     if hasattr(pipeline.embedder, 'n_dimensions'):
