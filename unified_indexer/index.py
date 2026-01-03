@@ -447,34 +447,60 @@ class HybridIndex:
         import re
         results: Dict[str, float] = {}
         
-        # Tokenize query into searchable terms
-        query_lower = query.lower()
-        query_original = query  # Keep original case for acronym matching
+        # Common abbreviation expansions for payment domain
+        abbreviations = {
+            'fedin': ['fedwire inbound', 'fed in', 'fedin', 'fedwire in'],
+            'fedout': ['fedwire outbound', 'fed out', 'fedout', 'fedwire out'],
+            'ltr': ['ltr', 'letter', 'advise ltr', 'advice ltr'],
+            'mt103': ['mt103', 'mt-103', 'mt 103'],
+            'mt202': ['mt202', 'mt-202', 'mt 202'],
+            'pacs008': ['pacs008', 'pacs.008', 'pacs 008'],
+            'pacs009': ['pacs009', 'pacs.009', 'pacs 009'],
+            'ofac': ['ofac', 'sanctions screening', 'sanctions'],
+            'aml': ['aml', 'anti-money laundering', 'anti money laundering'],
+            'bic': ['bic', 'swift code', 'bank identifier'],
+            'iban': ['iban', 'international bank account'],
+            'cov': ['cov', 'cover', 'coverage'],
+            'stp': ['stp', 'straight through processing'],
+            'swift': ['swift', 'society for worldwide'],
+        }
         
-        # Extract individual terms (filter out common stop words)
+        def tokenize(text: str) -> List[str]:
+            """Tokenize text on common delimiters"""
+            # Split on whitespace, underscores, hyphens, dots, slashes, etc.
+            tokens = re.split(r'[\s_\-./\\,;:()\[\]{}]+', text.lower())
+            # Filter empty and single-char tokens
+            return [t.strip() for t in tokens if len(t.strip()) >= 2]
+        
+        def get_expanded_terms(term: str) -> List[str]:
+            """Get expanded forms of abbreviations"""
+            term_lower = term.lower()
+            expanded = [term_lower]
+            if term_lower in abbreviations:
+                expanded.extend(abbreviations[term_lower])
+            return list(set(expanded))
+        
+        # Stop words to filter out
         stop_words = {'how', 'to', 'the', 'a', 'an', 'is', 'are', 'what', 'where', 'when', 'why', 
-                      'can', 'do', 'does', 'for', 'in', 'on', 'at', 'by', 'with', 'from'}
-        terms = [t.strip() for t in query_lower.split() 
-                 if len(t.strip()) >= 2 and t.strip() not in stop_words]
+                      'can', 'do', 'does', 'for', 'in', 'on', 'at', 'by', 'with', 'from', 'implement',
+                      'implementation', 'implementing', 'about', 'this', 'that', 'which'}
         
-        # Keep original-case terms for acronym matching
-        original_terms = [t.strip() for t in query_original.split() 
-                         if len(t.strip()) >= 2 and t.strip().lower() not in stop_words]
+        # Tokenize query
+        query_tokens = tokenize(query)
+        query_terms = [t for t in query_tokens if t not in stop_words]
         
-        # Build multi-word phrases (2-grams, 3-grams) from significant terms
-        phrases = []
-        if len(terms) >= 2:
-            for i in range(len(terms) - 1):
-                phrases.append(f"{terms[i]} {terms[i+1]}")
-        if len(terms) >= 3:
-            for i in range(len(terms) - 2):
-                phrases.append(f"{terms[i]} {terms[i+1]} {terms[i+2]}")
+        if not query_terms:
+            return results
         
-        # Add original-case phrases for acronym matching
-        original_phrases = []
-        if len(original_terms) >= 2:
-            for i in range(len(original_terms) - 1):
-                original_phrases.append(f"{original_terms[i]} {original_terms[i+1]}")
+        # Build expanded query terms (including abbreviation expansions)
+        expanded_query_terms = set()
+        for term in query_terms:
+            for exp in get_expanded_terms(term):
+                expanded_query_terms.add(exp)
+                # Also add individual tokens from multi-word expansions
+                for tok in tokenize(exp):
+                    if tok not in stop_words:
+                        expanded_query_terms.add(tok)
         
         # Search all chunks
         all_chunks = list(self.concept_index.chunks.values())
@@ -493,68 +519,102 @@ class HybridIndex:
                 if not any(cap in chunk_caps for cap in capabilities):
                     continue
             
-            # Get searchable text (combine text and embedding_text)
-            searchable_lower = (chunk.text + " " + (chunk.embedding_text or "")).lower()
-            searchable_original = chunk.text + " " + (chunk.embedding_text or "")
+            # Collect all searchable text sources
+            text_parts = [chunk.text]
+            if chunk.embedding_text:
+                text_parts.append(chunk.embedding_text)
             
-            # Also search in source_ref fields
-            if chunk.source_ref:
-                if hasattr(chunk.source_ref, 'procedure_name') and chunk.source_ref.procedure_name:
-                    searchable_lower += " " + chunk.source_ref.procedure_name.lower()
-                    searchable_original += " " + chunk.source_ref.procedure_name
-                if hasattr(chunk.source_ref, 'file_path') and chunk.source_ref.file_path:
-                    searchable_lower += " " + chunk.source_ref.file_path.lower()
-                    searchable_original += " " + chunk.source_ref.file_path
+            # Get filename (important for matching)
+            filename = ""
+            if chunk.source_ref and hasattr(chunk.source_ref, 'file_path') and chunk.source_ref.file_path:
+                filename = chunk.source_ref.file_path
+                text_parts.append(filename)
+            
+            # Get procedure name
+            if chunk.source_ref and hasattr(chunk.source_ref, 'procedure_name') and chunk.source_ref.procedure_name:
+                text_parts.append(chunk.source_ref.procedure_name)
+            
+            # Create searchable representations
+            full_text = " ".join(text_parts)
+            full_text_lower = full_text.lower()
+            full_text_tokens = set(tokenize(full_text))
+            
+            # Tokenize filename separately for boosted matching
+            filename_tokens = set(tokenize(filename)) if filename else set()
             
             # Score based on matches
             score = 0.0
-            matched_terms = []
+            matched_info = []
             
-            # Check multi-word phrase matches (most important for technical terms)
-            for phrase in phrases:
-                if phrase in searchable_lower:
-                    score += 1.0  # High score for phrase match
-                    matched_terms.append(phrase)
+            # === FILENAME TOKEN MATCHING (highest priority) ===
+            filename_matches = 0
+            for term in query_terms:
+                term_matched = False
+                # Direct match
+                if term in filename_tokens:
+                    filename_matches += 1
+                    term_matched = True
+                    matched_info.append(f"filename:{term}")
+                else:
+                    # Check expanded forms
+                    for exp in get_expanded_terms(term):
+                        exp_toks = tokenize(exp)
+                        if any(et in filename_tokens for et in exp_toks):
+                            filename_matches += 1
+                            term_matched = True
+                            matched_info.append(f"filename:{term}→{exp}")
+                            break
             
-            # Check original-case phrases (for acronyms like "FedIn LTR")
-            for phrase in original_phrases:
-                if phrase in searchable_original:
-                    score += 0.8
-                    if phrase.lower() not in matched_terms:
-                        matched_terms.append(phrase.lower())
+            if query_terms and filename_matches > 0:
+                filename_coverage = filename_matches / len(query_terms)
+                score += 2.0 * filename_coverage  # Strong boost for filename matches
+                if filename_matches >= len(query_terms):
+                    score += 1.0  # Big bonus for all query terms in filename
             
-            # Check individual terms
-            term_matches = 0
-            for term in terms:
-                # Use word boundary matching for better precision
-                if re.search(r'\b' + re.escape(term) + r'\b', searchable_lower):
-                    term_matches += 1
-                    if term not in matched_terms:
-                        matched_terms.append(term)
-                elif term in searchable_lower:
-                    # Partial match (term appears within a word)
-                    term_matches += 0.5
-                    if term not in matched_terms:
-                        matched_terms.append(term)
+            # === CONTENT TOKEN MATCHING ===
+            content_matches = 0
+            for term in query_terms:
+                # Direct token match
+                if term in full_text_tokens:
+                    content_matches += 1
+                    matched_info.append(f"token:{term}")
+                else:
+                    # Check expanded forms in tokens
+                    for exp in get_expanded_terms(term):
+                        exp_toks = tokenize(exp)
+                        if any(et in full_text_tokens for et in exp_toks):
+                            content_matches += 1
+                            matched_info.append(f"token:{term}→{exp}")
+                            break
             
-            # Score based on term coverage
-            if terms and term_matches > 0:
-                term_coverage = term_matches / len(terms)
-                score += 0.5 * term_coverage
-                
-                # Bonus for all terms matching
-                if term_matches >= len(terms):
-                    score += 0.4
+            if query_terms and content_matches > 0:
+                content_coverage = content_matches / len(query_terms)
+                score += 1.0 * content_coverage
+                if content_matches >= len(query_terms):
+                    score += 0.5  # Bonus for all terms present
             
-            # Count occurrences for additional scoring (TF-like boost)
-            if matched_terms:
-                for term in matched_terms[:3]:  # Limit to top 3 terms
-                    occurrences = searchable_lower.count(term)
-                    score += min(occurrences * 0.1, 0.3)  # Cap at 0.3 per term
+            # === SUBSTRING/PHRASE MATCHING ===
+            # Check for expanded phrases in the raw text
+            for term in query_terms:
+                for exp in get_expanded_terms(term):
+                    if len(exp) >= 3 and exp in full_text_lower:
+                        score += 0.5
+                        matched_info.append(f"substr:{exp}")
+                        break
+            
+            # === MULTI-WORD PHRASE MATCHING ===
+            if len(query_terms) >= 2:
+                # Try matching consecutive query terms
+                query_phrase = ' '.join(query_terms)
+                # Normalize both for comparison
+                normalized_text = re.sub(r'[\s_\-./\\]+', ' ', full_text_lower)
+                if query_phrase in normalized_text:
+                    score += 1.5
+                    matched_info.append(f"phrase:{query_phrase}")
             
             if score > 0:
                 # Normalize score to 0-1 range (cap at 1.0)
-                score = min(score / 2.5, 1.0)
+                score = min(score / 4.0, 1.0)
                 results[chunk.chunk_id] = score
         
         return results
