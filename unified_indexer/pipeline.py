@@ -161,12 +161,12 @@ class IndexingPipeline:
             if 'vocabulary_entries' not in kwargs and self.vocabulary:
                 # Extract vocabulary entries from DomainVocabulary
                 vocab_entries = []
-                for entry in self.vocabulary.entries.values():
+                for entry in self.vocabulary.entries:  # entries is a List, not dict
                     vocab_entries.append({
-                        'keywords': ','.join([entry.canonical_term] + entry.synonyms),
-                        'related_keywords': ','.join(entry.related_terms),
-                        'business_capability': entry.capabilities,
-                        'description': ''
+                        'keywords': ','.join([entry.canonical_term] + entry.keywords),
+                        'related_keywords': ','.join(entry.related_keywords),
+                        'business_capability': entry.business_capabilities,
+                        'description': entry.description
                     })
                 kwargs['vocabulary_entries'] = vocab_entries
         
