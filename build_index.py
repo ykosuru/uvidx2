@@ -153,6 +153,85 @@ def index_tal_directory(pipeline: IndexingPipeline,
     return stats
 
 
+def index_code_directory(pipeline: IndexingPipeline, 
+                         code_dir: str, 
+                         recursive: bool = True) -> dict:
+    """Index all code files (C, C++, Java, Python, etc.) in a directory"""
+    stats = {
+        "files_processed": 0,
+        "files_failed": 0,
+        "chunks_created": 0,
+        "errors": []
+    }
+    
+    code_path = Path(code_dir)
+    if not code_path.exists():
+        print(f"Warning: Code directory does not exist: {code_dir}")
+        return stats
+    
+    # Supported code extensions
+    extensions = [
+        # C/C++
+        "*.c", "*.h", "*.cpp", "*.hpp", "*.cc", "*.cxx", "*.hxx",
+        # Java
+        "*.java",
+        # Python
+        "*.py",
+        # JavaScript/TypeScript
+        "*.js", "*.jsx", "*.ts", "*.tsx",
+        # C#
+        "*.cs",
+        # Go
+        "*.go",
+        # Rust
+        "*.rs",
+        # Ruby
+        "*.rb",
+        # PHP
+        "*.php",
+        # Swift
+        "*.swift",
+        # Kotlin
+        "*.kt", "*.kts",
+        # Scala
+        "*.scala",
+    ]
+    
+    code_files = []
+    for ext in extensions:
+        pattern = f"**/{ext}" if recursive else ext
+        code_files.extend(code_path.glob(pattern))
+    
+    # Remove duplicates
+    code_files = list(set(code_files))
+    
+    print(f"\nIndexing {len(code_files)} code files from {code_dir}...")
+    
+    for code_file in code_files:
+        try:
+            print(f"  Processing: {code_file.name}...", end=" ", flush=True)
+            
+            with open(code_file, 'rb') as f:
+                content = f.read()
+            
+            chunks = pipeline.index_content(
+                content,
+                str(code_file),
+                SourceType.CODE
+            )
+            
+            stats["files_processed"] += 1
+            stats["chunks_created"] += len(chunks)
+            print(f"✓ ({len(chunks)} chunks)")
+            
+        except Exception as e:
+            stats["files_failed"] += 1
+            stats["errors"].append(f"{code_file}: {str(e)}")
+            print(f"✗ Error: {str(e)[:50]}")
+    
+    return stats
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build search index from PDF documents and TAL code files",
@@ -168,6 +247,7 @@ Examples:
     
     parser.add_argument("--pdf-dir", type=str, help="Directory containing PDF documents")
     parser.add_argument("--tal-dir", type=str, help="Directory containing TAL code (.txt files)")
+    parser.add_argument("--code-dir", type=str, help="Directory containing code files (C, C++, Java, Python, etc.)")
     parser.add_argument("--output", "-o", type=str, required=True, help="Output directory for index")
     parser.add_argument("--vocab", "-v", type=str, default=DEFAULT_KEYWORDS_FILE,
                         help=f"Path to vocabulary JSON file (default: keywords.json)")
@@ -190,8 +270,8 @@ Examples:
     args = parser.parse_args()
     
     # Validate inputs
-    if not args.pdf_dir and not args.tal_dir:
-        print("Error: At least one of --pdf-dir or --tal-dir is required")
+    if not args.pdf_dir and not args.tal_dir and not args.code_dir:
+        print("Error: At least one of --pdf-dir, --tal-dir, or --code-dir is required")
         sys.exit(1)
     
     recursive = not args.no_recursive
@@ -302,12 +382,32 @@ Examples:
     
     elif args.embedder in ["learned", "learned_hybrid"]:
         if not dimensions_path:
-            print("Error: --dimensions required for learned embedder (or use --learn-dims)")
-            sys.exit(1)
-        if not os.path.exists(dimensions_path):
-            print(f"Error: Dimensions file not found: {dimensions_path}")
-            sys.exit(1)
-        embedder_kwargs['dimensions_path'] = dimensions_path
+            # No dimensions file provided - check if we have vocabulary to create from
+            if vocab_data:
+                print("\nNo dimensions file provided, creating from vocabulary...")
+                from unified_indexer.learned_embeddings import LearnedDomainEmbedder, LearningConfig
+                
+                config = LearningConfig(n_dimensions=args.dims if args.dims else 80)
+                learned_embedder = LearnedDomainEmbedder(config)
+                learned_embedder.dimensions = []
+                learned_embedder.term_to_dimensions = {}
+                learned_embedder.inject_vocabulary(vocab_data, verbose=True)
+                
+                # Save dimensions
+                dimensions_path = os.path.join(args.output, 'dimensions.json')
+                os.makedirs(args.output, exist_ok=True)
+                learned_embedder.save(dimensions_path)
+                
+                embedder_kwargs['dimensions_path'] = dimensions_path
+                print(f"Dimensions saved to: {dimensions_path}")
+            else:
+                print("Error: --dimensions required for learned embedder (or use --learn-dims, or provide --vocab)")
+                sys.exit(1)
+        else:
+            if not os.path.exists(dimensions_path):
+                print(f"Error: Dimensions file not found: {dimensions_path}")
+                sys.exit(1)
+            embedder_kwargs['dimensions_path'] = dimensions_path
     
     # Create pipeline
     print(f"\nInitializing pipeline with '{args.embedder}' embedder...")
@@ -337,7 +437,8 @@ Examples:
     
     total_stats = {
         "pdf": {"files_processed": 0, "chunks_created": 0, "files_failed": 0},
-        "tal": {"files_processed": 0, "chunks_created": 0, "files_failed": 0}
+        "tal": {"files_processed": 0, "chunks_created": 0, "files_failed": 0},
+        "code": {"files_processed": 0, "chunks_created": 0, "files_failed": 0}
     }
     
     # Index PDFs
@@ -350,6 +451,11 @@ Examples:
         tal_stats = index_tal_directory(pipeline, args.tal_dir, recursive)
         total_stats["tal"] = tal_stats
     
+    # Index generic code (C, C++, Java, Python, etc.)
+    if args.code_dir:
+        code_stats = index_code_directory(pipeline, args.code_dir, recursive)
+        total_stats["code"] = code_stats
+    
     # Save index
     print(f"\nSaving index to: {args.output}")
     os.makedirs(args.output, exist_ok=True)
@@ -361,6 +467,7 @@ Examples:
         "embedder_type": args.embedder,
         "pdf_dir": args.pdf_dir,
         "tal_dir": args.tal_dir,
+        "code_dir": args.code_dir,
         "stats": total_stats
     }
     with open(os.path.join(args.output, "index_meta.json"), 'w') as f:
@@ -381,13 +488,21 @@ Examples:
     print(f"  Files failed:    {total_stats['tal'].get('files_failed', 0)}")
     print(f"  Chunks created:  {total_stats['tal'].get('chunks_created', 0)}")
     
+    print(f"\nGeneric Code (C/C++/Java/Python/etc.):")
+    print(f"  Files processed: {total_stats['code'].get('files_processed', 0)}")
+    print(f"  Files failed:    {total_stats['code'].get('files_failed', 0)}")
+    print(f"  Chunks created:  {total_stats['code'].get('chunks_created', 0)}")
+    
     total_chunks = (total_stats['pdf'].get('chunks_created', 0) + 
-                    total_stats['tal'].get('chunks_created', 0))
+                    total_stats['tal'].get('chunks_created', 0) +
+                    total_stats['code'].get('chunks_created', 0))
     print(f"\nTotal chunks indexed: {total_chunks}")
     print(f"Index saved to: {args.output}")
     
     # Print errors if any
-    all_errors = total_stats['pdf'].get('errors', []) + total_stats['tal'].get('errors', [])
+    all_errors = (total_stats['pdf'].get('errors', []) + 
+                  total_stats['tal'].get('errors', []) +
+                  total_stats['code'].get('errors', []))
     if all_errors:
         print(f"\n⚠️  Errors encountered ({len(all_errors)}):")
         for err in all_errors[:5]:

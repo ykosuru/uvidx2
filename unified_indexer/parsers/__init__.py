@@ -9,10 +9,12 @@ from .base import ContentParser
 from .tal_parser import TalCodeParser
 from .document_parser import DocumentParser
 from .log_parser import LogParser
+from .code_parser import GenericCodeParser
 
 __all__ = [
     "ContentParser",
     "TalCodeParser", 
     "DocumentParser",
-    "LogParser"
+    "LogParser",
+    "GenericCodeParser"
 ]

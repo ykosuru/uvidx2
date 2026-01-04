@@ -19,6 +19,7 @@ from .parsers.base import ContentParser
 from .parsers.tal_parser import TalCodeParser
 from .parsers.document_parser import DocumentParser
 from .parsers.log_parser import LogParser
+from .parsers.code_parser import GenericCodeParser
 from .index import HybridIndex
 from .embeddings import (
     create_embedder,
@@ -133,12 +134,19 @@ class IndexingPipeline:
     
     def _init_parsers(self, tal_parser_path: Optional[str] = None):
         """Initialize all content parsers"""
-        self.parsers[SourceType.CODE] = TalCodeParser(
-            self.vocabulary, 
-            tal_parser_path=tal_parser_path
-        )
-        self.parsers[SourceType.DOCUMENT] = DocumentParser(self.vocabulary)
-        self.parsers[SourceType.LOG] = LogParser(self.vocabulary)
+        # Use a list so we can have multiple parsers for the same SourceType
+        # (e.g., TalCodeParser for TAL, GenericCodeParser for C/C++/Java)
+        self.parser_list: List[ContentParser] = [
+            TalCodeParser(self.vocabulary, tal_parser_path=tal_parser_path),
+            GenericCodeParser(),  # Handles C, C++, Java, Python, etc.
+            DocumentParser(self.vocabulary),
+            LogParser(self.vocabulary),
+        ]
+        
+        # Also keep dict for backward compatibility
+        self.parsers[SourceType.CODE] = self.parser_list[0]  # TAL as default
+        self.parsers[SourceType.DOCUMENT] = self.parser_list[2]
+        self.parsers[SourceType.LOG] = self.parser_list[3]
     
     def set_embedding_function(self, fn: Callable[[str], List[float]]):
         """Set the embedding function for vector search"""
@@ -161,12 +169,12 @@ class IndexingPipeline:
             if 'vocabulary_entries' not in kwargs and self.vocabulary:
                 # Extract vocabulary entries from DomainVocabulary
                 vocab_entries = []
-                for entry in self.vocabulary.entries.values():
+                for entry in self.vocabulary.entries:  # entries is a List, not dict
                     vocab_entries.append({
-                        'keywords': ','.join([entry.canonical_term] + entry.synonyms),
-                        'related_keywords': ','.join(entry.related_terms),
-                        'business_capability': entry.capabilities,
-                        'description': ''
+                        'keywords': ','.join([entry.canonical_term] + entry.keywords),
+                        'related_keywords': ','.join(entry.related_keywords),
+                        'business_capability': entry.business_capabilities,
+                        'description': entry.description
                     })
                 kwargs['vocabulary_entries'] = vocab_entries
         
@@ -228,7 +236,8 @@ class IndexingPipeline:
         Returns:
             Appropriate parser or None if no parser matches
         """
-        for parser in self.parsers.values():
+        # Check all parsers in parser_list
+        for parser in self.parser_list:
             if parser.can_parse(file_path):
                 return parser
         return None
