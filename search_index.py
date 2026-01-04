@@ -24,7 +24,7 @@ Arguments:
     --analyze     Send results to LLM for analysis
     --provider    LLM provider: anthropic, openai, ollama, stub (default: anthropic)
     --model       LLM model name (provider-specific)
-    --min-score   Minimum score for LLM analysis (default: 0.70)
+    --min-score   Minimum score for LLM analysis (default: 0.50)
 """
 
 import sys
@@ -192,7 +192,7 @@ def search_and_analyze(pipeline: IndexingPipeline,
                        provider: 'LLMProvider',
                        top_k: int = 20,
                        source_type: str = "all",
-                       min_score: float = 0.70,
+                       min_score: float = 0.50,
                        verbose: bool = False):
     """Search and analyze with LLM"""
     
@@ -271,7 +271,7 @@ def list_capabilities(pipeline: IndexingPipeline):
 
 def interactive_mode(pipeline: IndexingPipeline, 
                      provider: 'LLMProvider' = None,
-                     min_score: float = 0.70,
+                     min_score: float = 0.50,
                      verbose: bool = False):
     """Run interactive search mode"""
     print("\n" + "=" * 60)
@@ -436,8 +436,8 @@ Examples:
                         help="LLM model name (provider-specific)")
     parser.add_argument("--api-url", type=str, default=None,
                         help="Base URL for internal API provider")
-    parser.add_argument("--min-score", type=float, default=0.70,
-                        help="Minimum score for LLM analysis (default: 0.70)")
+    parser.add_argument("--min-score", type=float, default=0.50,
+                        help="Minimum score for LLM analysis (default: 0.50)")
     
     args = parser.parse_args()
     

@@ -768,8 +768,14 @@ def create_embedder(
     elif embedder_type == "learned":
         from .learned_embeddings import LearnedDomainEmbedder
         dimensions_path = kwargs.get('dimensions_path')
+        vocabulary_entries = kwargs.get('vocabulary_entries')
+        
         if dimensions_path:
-            return LearnedDomainEmbedder.load(dimensions_path)
+            embedder = LearnedDomainEmbedder.load(dimensions_path)
+            # Inject vocabulary if provided
+            if vocabulary_entries:
+                embedder.inject_vocabulary(vocabulary_entries, verbose=False)
+            return embedder
         else:
             # Return unfitted embedder - must call fit() before use
             from .learned_embeddings import LearningConfig
@@ -782,10 +788,16 @@ def create_embedder(
     elif embedder_type == "learned_hybrid":
         from .learned_embeddings import LearnedDomainEmbedder, HybridLearnedEmbedder
         dimensions_path = kwargs.get('dimensions_path')
+        vocabulary_entries = kwargs.get('vocabulary_entries')
+        
         if not dimensions_path:
             raise ValueError("dimensions_path required for learned_hybrid embedder")
         
         learned = LearnedDomainEmbedder.load(dimensions_path)
+        # Inject vocabulary if provided
+        if vocabulary_entries:
+            learned.inject_vocabulary(vocabulary_entries, verbose=False)
+            
         return HybridLearnedEmbedder(
             learned_embedder=learned,
             text_dim=kwargs.get('text_dim', 512),

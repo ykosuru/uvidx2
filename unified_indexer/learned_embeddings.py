@@ -612,6 +612,235 @@ class LearnedDomainEmbedder:
             for term, weight in dim.term_weights.items():
                 self.term_to_dimensions[term].append((dim.id, weight))
     
+    def inject_vocabulary(self, 
+                          vocabulary_entries: List[Dict],
+                          verbose: bool = True) -> 'LearnedDomainEmbedder':
+        """
+        Inject domain vocabulary terms into the dimension space.
+        
+        GUARANTEES: Every keyword in vocabulary_entries will have a dimension mapping.
+        
+        Strategy:
+        1. Create a dimension for each vocabulary entry (grouped synonyms)
+        2. Verify ALL keywords have mappings
+        3. Create individual dimensions for any unmapped keywords
+        
+        Args:
+            vocabulary_entries: List of vocabulary entry dicts with 'keywords', 
+                               'related_keywords', 'business_capability', etc.
+            verbose: Print progress
+            
+        Returns:
+            self (for chaining)
+        """
+        if verbose:
+            print(f"Injecting {len(vocabulary_entries)} vocabulary entries into dimensions...")
+        
+        # Ensure term_to_dimensions is a defaultdict
+        if not isinstance(self.term_to_dimensions, defaultdict):
+            old_data = dict(self.term_to_dimensions) if self.term_to_dimensions else {}
+            self.term_to_dimensions = defaultdict(list)
+            self.term_to_dimensions.update(old_data)
+        
+        # Collect ALL keywords first
+        all_vocab_keywords = set()
+        entry_terms_map = []  # [(primary_term, [all_terms], capabilities), ...]
+        
+        for entry in vocabulary_entries:
+            keywords_raw = entry.get('keywords', '')
+            related_raw = entry.get('related_keywords', '')
+            capabilities = entry.get('business_capability', [])
+            
+            entry_terms = []
+            
+            # Primary keywords
+            for kw in keywords_raw.split(','):
+                term = kw.strip().lower()
+                if term and len(term) >= 2:
+                    entry_terms.append(term)
+                    all_vocab_keywords.add(term)
+            
+            # Related keywords  
+            for kw in related_raw.split(','):
+                term = kw.strip().lower()
+                if term and len(term) >= 2:
+                    entry_terms.append(term)
+                    all_vocab_keywords.add(term)
+            
+            if entry_terms:
+                entry_terms_map.append((entry_terms[0], entry_terms, capabilities))
+        
+        if verbose:
+            print(f"  Total unique keywords to map: {len(all_vocab_keywords)}")
+        
+        added_dims = 0
+        extended_terms = 0
+        
+        # Step 1: Create/extend dimensions for each vocabulary entry
+        for primary_term, all_terms, capabilities in entry_terms_map:
+            # Check if primary term already has a dimension
+            if primary_term in self.term_to_dimensions:
+                # Extend existing dimension with all synonyms
+                best_dim_id = max(self.term_to_dimensions[primary_term], key=lambda x: x[1])[0]
+                dim = self.dimensions[best_dim_id]
+                
+                for term in all_terms:
+                    if term not in dim.term_weights:
+                        dim.terms.append(term)
+                        dim.term_weights[term] = 0.9  # High weight for vocab terms
+                        self.term_to_dimensions[term].append((dim.id, 0.9))
+                        extended_terms += 1
+            else:
+                # Create new dimension for this vocabulary entry
+                new_dim_id = len(self.dimensions)
+                
+                # Create term weights
+                term_weights = {}
+                for i, term in enumerate(all_terms):
+                    weight = 1.0 if i == 0 else 0.9
+                    term_weights[term] = weight
+                
+                dim_name = f"VOCAB_{primary_term.upper().replace(' ', '_').replace('-', '_')}"
+                
+                new_dim = LearnedDimension(
+                    id=new_dim_id,
+                    name=dim_name,
+                    terms=all_terms,
+                    term_weights=term_weights,
+                    document_frequency=0,
+                    coherence_score=1.0
+                )
+                
+                self.dimensions.append(new_dim)
+                
+                # Update term lookup for ALL terms in this entry
+                for term, weight in term_weights.items():
+                    self.term_to_dimensions[term].append((new_dim_id, weight))
+                
+                added_dims += 1
+        
+        # Step 2: Verify ALL keywords have dimension mappings
+        unmapped = []
+        for kw in all_vocab_keywords:
+            if kw not in self.term_to_dimensions:
+                unmapped.append(kw)
+        
+        if verbose and unmapped:
+            print(f"  Found {len(unmapped)} unmapped keywords, creating individual dimensions...")
+        
+        # Step 3: Create individual dimensions for any unmapped keywords
+        for kw in unmapped:
+            new_dim_id = len(self.dimensions)
+            dim_name = f"KW_{kw.upper().replace(' ', '_').replace('-', '_')}"
+            
+            new_dim = LearnedDimension(
+                id=new_dim_id,
+                name=dim_name,
+                terms=[kw],
+                term_weights={kw: 1.0},
+                document_frequency=0,
+                coherence_score=1.0
+            )
+            
+            self.dimensions.append(new_dim)
+            self.term_to_dimensions[kw].append((new_dim_id, 1.0))
+            added_dims += 1
+        
+        # Step 4: Create dimensions for business capabilities
+        capability_terms = set()
+        for _, _, capabilities in entry_terms_map:
+            for cap in capabilities:
+                cap_lower = cap.lower().strip()
+                if cap_lower and len(cap_lower) >= 2:
+                    capability_terms.add(cap_lower)
+        
+        for cap in capability_terms:
+            if cap not in self.term_to_dimensions:
+                new_dim_id = len(self.dimensions)
+                cap_name = f"CAP_{cap.upper().replace(' ', '_').replace('-', '_')}"
+                
+                new_dim = LearnedDimension(
+                    id=new_dim_id,
+                    name=cap_name,
+                    terms=[cap],
+                    term_weights={cap: 1.0},
+                    document_frequency=0,
+                    coherence_score=1.0
+                )
+                
+                self.dimensions.append(new_dim)
+                self.term_to_dimensions[cap].append((new_dim_id, 1.0))
+                added_dims += 1
+        
+        self._fitted = True
+        
+        # Final verification
+        final_unmapped = [kw for kw in all_vocab_keywords if kw not in self.term_to_dimensions]
+        
+        if verbose:
+            print(f"  Added {added_dims} new dimensions")
+            print(f"  Extended {extended_terms} terms in existing dimensions")
+            print(f"  Total dimensions: {len(self.dimensions)}")
+            print(f"  Mapped keywords: {len(all_vocab_keywords) - len(final_unmapped)}/{len(all_vocab_keywords)}")
+            if final_unmapped:
+                print(f"  WARNING: {len(final_unmapped)} keywords still unmapped: {final_unmapped[:10]}")
+        
+        return self
+    
+    def get_keyword_coverage(self, vocabulary_entries: List[Dict]) -> Dict:
+        """
+        Check which vocabulary keywords are mapped to dimensions.
+        
+        Returns:
+            Dict with 'mapped', 'unmapped', 'coverage_pct' keys
+        """
+        all_keywords = set()
+        for entry in vocabulary_entries:
+            for kw in entry.get('keywords', '').split(','):
+                term = kw.strip().lower()
+                if term and len(term) >= 2:
+                    all_keywords.add(term)
+            for kw in entry.get('related_keywords', '').split(','):
+                term = kw.strip().lower()
+                if term and len(term) >= 2:
+                    all_keywords.add(term)
+        
+        mapped = [kw for kw in all_keywords if kw in self.term_to_dimensions]
+        unmapped = [kw for kw in all_keywords if kw not in self.term_to_dimensions]
+        
+        return {
+            'total': len(all_keywords),
+            'mapped': mapped,
+            'unmapped': unmapped,
+            'coverage_pct': len(mapped) / len(all_keywords) * 100 if all_keywords else 100
+        }
+    
+    def fit_with_vocabulary(self,
+                            documents: List[str],
+                            vocabulary_entries: List[Dict],
+                            verbose: bool = True) -> 'LearnedDomainEmbedder':
+        """
+        Learn dimensions from corpus AND inject vocabulary terms.
+        
+        This combines corpus-based learning with explicit vocabulary,
+        ensuring all domain terms are in the dimension space.
+        
+        Args:
+            documents: List of document texts
+            vocabulary_entries: Domain vocabulary entries
+            verbose: Print progress
+            
+        Returns:
+            self (for chaining)
+        """
+        # First learn from corpus
+        self.fit(documents, verbose=verbose)
+        
+        # Then inject vocabulary
+        self.inject_vocabulary(vocabulary_entries, verbose=verbose)
+        
+        return self
+    
     def get_embedding(self, text: str) -> List[float]:
         """
         Generate embedding for text using learned dimensions.

@@ -152,10 +152,24 @@ class IndexingPipeline:
         Set a local embedder.
         
         Args:
-            embedder_type: Type of embedder ("hash", "hybrid", "tfidf", "domain", "bm25")
+            embedder_type: Type of embedder ("hash", "hybrid", "tfidf", "domain", "bm25", "learned")
             fit_documents: Documents to fit the embedder on (for tfidf/bm25)
             **kwargs: Additional embedder arguments
         """
+        # For learned embedders, pass vocabulary entries for injection
+        if embedder_type in ["learned", "learned_hybrid"]:
+            if 'vocabulary_entries' not in kwargs and self.vocabulary:
+                # Extract vocabulary entries from DomainVocabulary
+                vocab_entries = []
+                for entry in self.vocabulary.entries.values():
+                    vocab_entries.append({
+                        'keywords': ','.join([entry.canonical_term] + entry.synonyms),
+                        'related_keywords': ','.join(entry.related_terms),
+                        'business_capability': entry.capabilities,
+                        'description': ''
+                    })
+                kwargs['vocabulary_entries'] = vocab_entries
+        
         self.embedder = create_embedder(
             embedder_type=embedder_type,
             domain_vocabulary=self.vocabulary,

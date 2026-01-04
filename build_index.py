@@ -280,7 +280,13 @@ Examples:
         )
         
         learned_embedder = LearnedDomainEmbedder(config)
-        learned_embedder.fit(all_docs, verbose=True)
+        
+        # Learn from corpus AND inject vocabulary terms
+        if vocab_data:
+            print(f"\nLearning with vocabulary injection ({len(vocab_data)} entries)...")
+            learned_embedder.fit_with_vocabulary(all_docs, vocab_data, verbose=True)
+        else:
+            learned_embedder.fit(all_docs, verbose=True)
         
         # Save dimensions
         dimensions_path = os.path.join(args.output, 'dimensions.json')

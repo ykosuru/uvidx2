@@ -378,6 +378,17 @@ class HybridIndex:
                 (effective_keyword_weight * k_score)
             ) / total_weight if total_weight > 0 else 0
             
+            # Boost score when we have strong concept AND keyword matches
+            # This indicates a direct term match which should rank highly
+            if c_score >= 0.5 and k_score >= 0.5:
+                # Both concept and keyword matched - high confidence
+                boost = min(c_score, k_score) * 0.3  # Up to 0.3 boost
+                combined_score = min(combined_score + boost, 1.0)
+            elif c_score >= 0.8 or k_score >= 0.8:
+                # At least one very strong match
+                boost = max(c_score, k_score) * 0.15
+                combined_score = min(combined_score + boost, 1.0)
+            
             # Get chunk from either store
             chunk = (
                 self.vector_store.get_chunk(chunk_id) or 
