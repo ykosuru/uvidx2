@@ -2,16 +2,193 @@
 """
 Knowledge Extractor - Build domain vocabulary with cross-referenced concepts
 
-This script:
-1. Extracts business terminology from PDFs using LLM
-2. Extracts domain-relevant symbols from TAL/COBOL code using smart filtering
-3. Cross-references to find high-value terms appearing in both
-4. Builds a tiered vocabulary with relationship links
-5. Outputs augmented keywords.json and knowledge graph
+================================================================================
+OVERVIEW
+================================================================================
 
-Usage:
-    python knowledge_extractor.py --docs ./pdfs --code ./tal_code --output vocabulary.json
-    python knowledge_extractor.py --docs ./specs --code ./src --graph knowledge_graph.json
+This module extracts domain-specific terminology from documentation (PDFs) and
+source code (TAL/COBOL), cross-references them to identify high-value terms,
+calculates TF-IDF statistics, and builds a knowledge graph linking concepts.
+
+================================================================================
+ARCHITECTURE & CLASS DESIGN
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           KNOWLEDGE EXTRACTOR                                │
+│                                                                             │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────────────┐ │
+│  │    PDFs     │    │    Code     │    │        KnowledgeExtractor       │ │
+│  │  (Business) │    │  (Technical)│    │                                 │ │
+│  └──────┬──────┘    └──────┬──────┘    │  • pdf_terms: Dict[str, Term]   │ │
+│         │                  │           │  • code_terms: Dict[str, Term]  │ │
+│         ▼                  ▼           │  • merged_terms: Dict[str, Term]│ │
+│  ┌──────────────┐   ┌──────────────┐   │  • relationships: List[Rel]     │ │
+│  │ LLM Extract  │   │ Pattern Match│   │  • document_term_sets: List     │ │
+│  │ (top 30/doc) │   │ (domain only)│   │                                 │ │
+│  └──────┬───────┘   └──────┬───────┘   └─────────────────────────────────┘ │
+│         │                  │                                                │
+│         └────────┬─────────┘                                                │
+│                  ▼                                                          │
+│         ┌───────────────────┐                                               │
+│         │  Cross-Reference  │  ◄─── Merge terms, boost confidence          │
+│         │  & TF-IDF Calc    │       for terms in BOTH sources              │
+│         └─────────┬─────────┘                                               │
+│                   │                                                         │
+│     ┌─────────────┼─────────────┐                                           │
+│     ▼             ▼             ▼                                           │
+│ ┌────────┐  ┌──────────┐  ┌──────────┐                                     │
+│ │ Vocab  │  │ Knowledge│  │ TF-IDF   │                                     │
+│ │ .json  │  │ Graph    │  │ Stats    │                                     │
+│ └────────┘  └──────────┘  └──────────┘                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+DATA CLASSES
+================================================================================
+
+ExtractedTerm
+─────────────
+Represents a single extracted term with all its metadata and statistics.
+
+    Fields:
+    ├── term: str              # Original term text (e.g., "WIRE_MESSAGE")
+    ├── normalized: str        # Lowercase normalized form for matching
+    ├── term_type: TermType    # STRUCTURE, PROCEDURE, CONSTANT, etc.
+    ├── source: TermSource     # PDF, CODE, or BOTH
+    ├── source_files: List     # Files where term was found
+    ├── context: str           # Description from LLM or comments
+    ├── related_terms: Set     # Terms that co-occur or are linked
+    ├── code_references: List  # [{file, line, type}, ...] for code terms
+    ├── confidence: float      # Boosted for multiple occurrences
+    │
+    │   TF-IDF Statistics:
+    ├── term_frequency: int    # Total occurrences across all documents
+    ├── document_frequency: int # Number of documents containing term
+    ├── idf_score: float       # log(total_docs / doc_frequency)
+    ├── tf_idf_score: float    # Combined TF-IDF importance score
+    └── co_occurrences: Dict   # {term: count} for co-occurring terms
+
+Relationship
+────────────
+Represents a relationship between two terms in the knowledge graph.
+
+    Fields:
+    ├── source_term: str       # Source node
+    ├── target_term: str       # Target node
+    ├── relationship_type: str # contains, implements, co_occurs_with, related_to
+    └── evidence: str          # File:line or "Co-occurred in N documents"
+
+================================================================================
+MAIN CLASS: KnowledgeExtractor
+================================================================================
+
+Methods (in processing order):
+─────────────────────────────
+
+1. EXTRACTION
+   ├── extract_from_pdf(file_path)     # LLM extracts business terms
+   │   └── _llm_extract_terms()        # Send to LLM, parse JSON response
+   │   └── _heuristic_extract_from_doc # Fallback regex patterns
+   │
+   └── extract_from_code(file_path)    # Pattern-based code extraction
+       ├── _extract_from_tal()         # TAL: STRUCT, PROC, DEFINE
+       ├── _extract_from_cobol()       # COBOL: records, paragraphs
+       └── _extract_from_c_like()      # C/Java: functions, structs
+
+2. FILTERING
+   └── is_domain_relevant(name)        # Check against DOMAIN_PATTERNS
+                                       # Reject GENERIC_NAMES (i, j, tmp, etc.)
+
+3. TF-IDF CALCULATION
+   ├── record_document_terms()         # Track terms per document
+   ├── calculate_tf_idf()              # Compute IDF and TF-IDF scores
+   └── calculate_co_occurrences()      # Find terms appearing together
+
+4. CROSS-REFERENCING
+   └── cross_reference()               # Merge PDF + code terms
+       ├── _merge_terms()              # Combine duplicate terms
+       └── _discover_relationships()   # Find implements, contains links
+
+5. OUTPUT GENERATION
+   ├── generate_vocabulary()           # keywords.json compatible format
+   ├── generate_knowledge_graph()      # Nodes + edges JSON
+   ├── get_statistics()                # TF-IDF statistics JSON
+   └── print_summary()                 # Console summary
+
+================================================================================
+TERM CONFIDENCE SCORING
+================================================================================
+
+Base confidence: 1.0
+
+Boosts:
+  +0.25  Term appears in additional PDF document
+  +0.10  Term appears in additional code file
+  +0.50  Term is cross-referenced (found in BOTH PDF and code)
+
+Example:
+  "wire_transfer" in 3 PDFs + 2 code files + cross-referenced
+  = 1.0 + (2 × 0.25) + (1 × 0.10) + 0.50 = 2.10 confidence
+
+================================================================================
+TF-IDF SCORING
+================================================================================
+
+Term Frequency (TF):
+  Raw count of term occurrences across all documents.
+  Log-normalized: tf = 1 + log(raw_count) if raw_count > 0
+
+Inverse Document Frequency (IDF):
+  idf = log(total_documents / (1 + document_frequency))
+  High IDF = rare/distinctive term
+  Low IDF = common/universal term
+
+TF-IDF Score:
+  tf_idf = tf × idf
+  Used to rank terms by distinctiveness/importance
+
+================================================================================
+RELATIONSHIP TYPES
+================================================================================
+
+  contains      Structure contains field (WIRE_MESSAGE → SENDER_BIC)
+  implements    Procedure implements concept (VALIDATE_BIC → bic_validation)
+  co_occurs_with Terms frequently appear together in same documents
+  related_to    Generic relationship from shared vocabulary
+
+================================================================================
+USAGE
+================================================================================
+
+    # Full extraction with LLM
+    python knowledge_extractor.py \\
+        --docs ./payment_specs \\
+        --code ./tal_code \\
+        --output vocabulary.json \\
+        --graph knowledge_graph.json \\
+        --stats term_statistics.json
+
+    # Offline mode (no LLM, pattern-based only)
+    python knowledge_extractor.py \\
+        --code ./legacy_code \\
+        --no-llm \\
+        --output vocab.json
+
+================================================================================
+OUTPUT FILES
+================================================================================
+
+vocabulary.json     Compatible with unified_indexer keywords.json format
+                    Includes _tf_idf_score, _term_frequency, _document_frequency
+
+knowledge_graph.json  Nodes (terms) + Edges (relationships)
+                      Each node has TF-IDF stats and co-occurrence list
+
+term_statistics.json  Aggregate statistics:
+                      - top_by_tf_idf (distinctive terms)
+                      - top_by_frequency (common terms)
+                      - top_by_document_frequency (universal terms)
 """
 
 import os
@@ -25,7 +202,11 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 
-# Import LLM provider
+# =============================================================================
+# OPTIONAL DEPENDENCIES
+# =============================================================================
+
+# LLM provider for intelligent PDF extraction
 try:
     from llm_provider import create_provider, LLMProvider, LLMResponse
     LLM_AVAILABLE = True
@@ -33,7 +214,7 @@ except ImportError:
     LLM_AVAILABLE = False
     print("Warning: llm_provider not found.")
 
-# PDF support
+# PyMuPDF for PDF text extraction
 try:
     import fitz  # PyMuPDF
     PDF_AVAILABLE = True
@@ -42,103 +223,273 @@ except ImportError:
     print("Warning: PyMuPDF not installed. PDF extraction will be limited.")
 
 
+# =============================================================================
+# ENUMS - Term classification
+# =============================================================================
+
 class TermSource(Enum):
-    """Where a term was found"""
-    PDF = "pdf"
-    CODE = "code"
-    BOTH = "both"
+    """
+    Where a term was discovered.
+    
+    BOTH indicates cross-referenced terms (highest value).
+    """
+    PDF = "pdf"      # Found in documentation
+    CODE = "code"    # Found in source code
+    BOTH = "both"    # Found in both (cross-referenced)
 
 
 class TermType(Enum):
-    """Type of term"""
-    BUSINESS_CONCEPT = "business_concept"      # From PDF - business terminology
-    STRUCTURE = "structure"                     # TAL STRUCT, COBOL record
-    PROCEDURE = "procedure"                     # TAL PROC, COBOL paragraph
-    CONSTANT = "constant"                       # DEFINE, LITERAL, 88 level
-    FIELD = "field"                            # Structure field
-    MESSAGE_TYPE = "message_type"              # MT-103, MT-202, etc.
-    ERROR_CODE = "error_code"                  # Error codes
-    ACRONYM = "acronym"                        # BIC, IBAN, OFAC, etc.
+    """
+    Classification of term type.
+    
+    Determines how the term is categorized in the vocabulary output.
+    """
+    BUSINESS_CONCEPT = "business_concept"  # From PDF - business terminology
+    STRUCTURE = "structure"                 # TAL STRUCT, COBOL record
+    PROCEDURE = "procedure"                 # TAL PROC, COBOL paragraph
+    CONSTANT = "constant"                   # DEFINE, LITERAL, 88 level
+    FIELD = "field"                        # Structure field
+    MESSAGE_TYPE = "message_type"          # MT-103, MT-202, etc.
+    ERROR_CODE = "error_code"              # Error codes
+    ACRONYM = "acronym"                    # BIC, IBAN, OFAC, etc.
 
+
+# =============================================================================
+# DATA CLASSES - Core data structures
+# =============================================================================
 
 @dataclass
 class ExtractedTerm:
-    """A term extracted from documents or code"""
-    term: str
-    normalized: str  # Lowercase, normalized form
-    term_type: TermType
-    source: TermSource
-    source_files: List[str] = field(default_factory=list)
-    context: str = ""  # Brief context/description
-    related_terms: Set[str] = field(default_factory=set)
-    code_references: List[Dict] = field(default_factory=list)  # {file, line, type}
-    confidence: float = 1.0
+    """
+    Represents a single extracted term with all metadata and statistics.
+    
+    This is the primary data structure used throughout the extraction pipeline.
+    Terms are keyed by their normalized form for deduplication and matching.
+    
+    Attributes:
+        term: Original term text as found in source (preserves case)
+        normalized: Lowercase, underscore-separated form for matching
+        term_type: Classification (STRUCTURE, PROCEDURE, CONSTANT, etc.)
+        source: Where found (PDF, CODE, or BOTH if cross-referenced)
+        source_files: List of files where this term was discovered
+        context: Description from LLM or extracted from comments
+        related_terms: Set of terms that are linked/co-occur
+        code_references: List of {file, line, type} for code locations
+        confidence: Score boosted by multiple occurrences and cross-referencing
+        
+    TF-IDF Statistics:
+        term_frequency: Raw count of occurrences across all documents
+        document_frequency: Number of unique documents containing term
+        idf_score: Inverse document frequency = log(total_docs / df)
+        tf_idf_score: Combined score for ranking importance
+        co_occurrences: Dict mapping co-occurring terms to counts
+    """
+    # Core identification
+    term: str                                           # Original text
+    normalized: str                                     # Normalized for matching
+    term_type: TermType                                # Classification
+    source: TermSource                                 # PDF, CODE, or BOTH
+    
+    # Source tracking
+    source_files: List[str] = field(default_factory=list)      # Files containing term
+    context: str = ""                                          # Description/definition
+    related_terms: Set[str] = field(default_factory=set)       # Linked terms
+    code_references: List[Dict] = field(default_factory=list)  # [{file, line, type}]
+    
+    # Confidence scoring
+    confidence: float = 1.0  # Boosted: +0.25/PDF, +0.10/code file, +0.50 if cross-ref
+    
+    # TF-IDF statistics (calculated after all documents processed)
+    term_frequency: int = 0           # Total occurrences across all docs
+    document_frequency: int = 0       # Number of docs containing this term
+    idf_score: float = 0.0           # log(total_docs / doc_frequency)
+    tf_idf_score: float = 0.0        # tf * idf - overall importance score
+    
+    # Co-occurrence tracking (for relationship discovery)
+    co_occurrences: Dict[str, int] = field(default_factory=dict)  # {term: count}
 
 
 @dataclass 
 class Relationship:
-    """Relationship between terms for knowledge graph"""
-    source_term: str
-    target_term: str
-    relationship_type: str  # implements, contains, calls, related_to, defined_in
-    evidence: str = ""  # Where this relationship was found
+    """
+    Represents a directed relationship between two terms in the knowledge graph.
+    
+    Relationships are discovered through:
+    - Code structure analysis (contains, implements)
+    - Co-occurrence analysis (co_occurs_with)
+    - Name pattern matching (related_to)
+    
+    Attributes:
+        source_term: The source node of the relationship
+        target_term: The target node of the relationship
+        relationship_type: One of: contains, implements, co_occurs_with, related_to
+        evidence: Supporting information (e.g., "file.tal:42" or "Co-occurred in 5 docs")
+    """
+    source_term: str           # From node
+    target_term: str           # To node
+    relationship_type: str     # contains | implements | co_occurs_with | related_to
+    evidence: str = ""         # File:line or occurrence count
+
+
+# =============================================================================
+# MAIN CLASS: KnowledgeExtractor
+# =============================================================================
 
 
 class KnowledgeExtractor:
     """
-    Extract and cross-reference domain knowledge from PDFs and code.
+    Main class for extracting and cross-referencing domain knowledge.
+    
+    This class orchestrates the entire extraction pipeline:
+    1. Extract terms from PDFs using LLM (or heuristics as fallback)
+    2. Extract terms from code using pattern matching
+    3. Cross-reference to identify high-value terms
+    4. Calculate TF-IDF statistics
+    5. Build relationships for knowledge graph
+    6. Generate output files
+    
+    Attributes:
+        llm: Optional LLM provider for intelligent PDF extraction
+        pdf_terms: Dict of terms extracted from PDF documents
+        code_terms: Dict of terms extracted from source code
+        merged_terms: Dict of all terms after cross-referencing
+        relationships: List of discovered relationships
+        total_documents: Count of processed documents for TF-IDF
+        document_term_sets: Terms per document for co-occurrence analysis
+    
+    Example:
+        extractor = KnowledgeExtractor(llm_provider)
+        
+        # Extract from sources
+        for pdf in pdfs:
+            terms = extractor.extract_from_pdf(pdf)
+            extractor.record_document_terms(terms, pdf)
+            
+        for code in code_files:
+            terms = extractor.extract_from_code(code)
+            extractor.record_document_terms(terms, code)
+        
+        # Cross-reference and calculate statistics
+        extractor.cross_reference()
+        
+        # Generate outputs
+        vocab = extractor.generate_vocabulary()
+        graph = extractor.generate_knowledge_graph()
+        stats = extractor.get_statistics()
     """
     
-    # Domain-relevant patterns to look for in code
+    # -------------------------------------------------------------------------
+    # Domain-relevant patterns for filtering code symbols
+    # These regex patterns identify payment/banking domain terminology
+    # -------------------------------------------------------------------------
     DOMAIN_PATTERNS = [
+        # Payment networks and protocols
         r'wire', r'transfer', r'payment', r'message', r'swift', r'fedwire',
         r'chips', r'ach', r'ofac', r'sanction', r'screen', r'compliance',
+        
+        # Financial identifiers
         r'bic', r'iban', r'aba', r'routing', r'account', r'beneficiary',
         r'originator', r'sender', r'receiver', r'correspondent', r'intermediary',
+        
+        # Settlement and processing
         r'settlement', r'clearing', r'netting', r'reconcil', r'balance',
         r'currency', r'amount', r'rate', r'fee', r'charge',
+        
+        # Operations
         r'validate', r'verify', r'check', r'error', r'reject', r'repair',
         r'queue', r'route', r'process', r'transaction', r'reference',
-        r'mt\d{3}', r'uetr', r'uti', r'lei',  # Message types and IDs
+        
+        # Message types and IDs
+        r'mt\d{3}',  # SWIFT MT messages (MT-103, MT-202, etc.)
+        r'uetr',     # Unique End-to-end Transaction Reference
+        r'uti',      # Unique Transaction Identifier
+        r'lei',      # Legal Entity Identifier
     ]
     
-    # Generic names to exclude
+    # -------------------------------------------------------------------------
+    # Generic programming names to exclude
+    # These are common variable names that add noise to the vocabulary
+    # -------------------------------------------------------------------------
     GENERIC_NAMES = {
+        # Loop variables
         'i', 'j', 'k', 'n', 'm', 'x', 'y', 'z',
+        # Temporary storage
         'tmp', 'temp', 'buf', 'buffer', 'ptr', 'len', 'length', 'size', 'count',
+        # Return values
         'result', 'status', 'ret', 'retval', 'rc', 'err', 'error',
+        # Generic types
         'str', 'string', 'num', 'int', 'val', 'value', 'data', 'info',
+        # Common names
         'flag', 'flags', 'index', 'idx', 'pos', 'offset',
         'begin', 'end', 'start', 'stop', 'first', 'last', 'next', 'prev',
         'input', 'output', 'in', 'out', 'src', 'dst', 'source', 'dest',
+        # Boolean/null
         'true', 'false', 'null', 'none', 'ok', 'fail',
     }
     
     def __init__(self, llm_provider: Optional[LLMProvider] = None):
+        """
+        Initialize the knowledge extractor.
+        
+        Args:
+            llm_provider: Optional LLM provider for intelligent PDF extraction.
+                         If None, falls back to heuristic pattern matching.
+        """
         self.llm = llm_provider
-        self.pdf_terms: Dict[str, ExtractedTerm] = {}
-        self.code_terms: Dict[str, ExtractedTerm] = {}
-        self.merged_terms: Dict[str, ExtractedTerm] = {}
+        
+        # Term storage (keyed by normalized form)
+        self.pdf_terms: Dict[str, ExtractedTerm] = {}    # Terms from documents
+        self.code_terms: Dict[str, ExtractedTerm] = {}   # Terms from code
+        self.merged_terms: Dict[str, ExtractedTerm] = {} # Combined after cross-ref
+        
+        # Relationship storage
         self.relationships: List[Relationship] = []
+        
+        # TF-IDF tracking
+        self.total_documents: int = 0                    # Document count
+        self.document_term_sets: List[Set[str]] = []     # Terms per doc for co-occurrence
+    
+    # =========================================================================
+    # FILTERING METHODS
+    # =========================================================================
     
     def is_domain_relevant(self, name: str) -> bool:
-        """Check if a name appears domain-relevant"""
+        """
+        Check if a symbol name is domain-relevant (worth including in vocabulary).
+        
+        A name is considered domain-relevant if:
+        1. It's not in the GENERIC_NAMES exclusion list
+        2. It's at least 3 characters long
+        3. It matches at least one DOMAIN_PATTERNS regex
+        
+        Args:
+            name: The symbol name to check (e.g., "WIRE_MESSAGE", "process_payment")
+            
+        Returns:
+            True if the name should be included in the vocabulary
+            
+        Examples:
+            is_domain_relevant("WIRE_MESSAGE")     -> True  (matches 'wire', 'message')
+            is_domain_relevant("tmp")              -> False (in GENERIC_NAMES)
+            is_domain_relevant("VALIDATE_BIC")     -> True  (matches 'validate', 'bic')
+            is_domain_relevant("i")                -> False (too short)
+        """
         name_lower = name.lower()
         
-        # Exclude generic names
+        # Exclude generic names (loop vars, temp vars, etc.)
         if name_lower in self.GENERIC_NAMES:
             return False
         
-        # Too short
+        # Reject names that are too short to be meaningful
         if len(name_lower) < 3:
             return False
         
-        # Check against domain patterns
+        # Check if name matches any domain pattern
         for pattern in self.DOMAIN_PATTERNS:
             if re.search(pattern, name_lower):
                 return True
         
-        # Check for meaningful structure (contains underscore with domain word)
+        # For compound names (WIRE_MESSAGE, validatePayment), check each part
         parts = name_lower.replace('-', '_').split('_')
         for part in parts:
             if len(part) > 3 and part not in self.GENERIC_NAMES:
@@ -149,17 +500,28 @@ class KnowledgeExtractor:
         return False
     
     def normalize_term(self, term: str) -> str:
-        """Normalize a term for comparison"""
-        # Lowercase
+        """
+        Normalize a term for comparison and deduplication.
+        
+        Normalization ensures that "WIRE_MESSAGE", "wire-message", and 
+        "Wire Message" all map to the same key: "wire_message"
+        
+        Args:
+            term: Raw term text
+            
+        Returns:
+            Normalized lowercase string with underscores as separators
+        """
+        # Convert to lowercase
         normalized = term.lower()
-        # Replace separators with underscore
+        # Replace hyphens and spaces with underscores
         normalized = re.sub(r'[-\s]+', '_', normalized)
-        # Remove special chars
+        # Remove any remaining special characters
         normalized = re.sub(r'[^a-z0-9_]', '', normalized)
         return normalized
     
     # =========================================================================
-    # PDF EXTRACTION
+    # PDF EXTRACTION - Extract business terms from documentation
     # =========================================================================
     
     def extract_from_pdf(self, file_path: str) -> List[ExtractedTerm]:
@@ -532,6 +894,182 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
         return terms
     
     # =========================================================================
+    # TF-IDF AND CO-OCCURRENCE STATISTICS
+    # 
+    # TF-IDF (Term Frequency - Inverse Document Frequency) measures how
+    # important a term is to a document collection. It helps distinguish:
+    # - Common terms (low IDF): appear in many documents (e.g., "payment")
+    # - Distinctive terms (high IDF): appear in few documents (e.g., "UETR")
+    # 
+    # Co-occurrence analysis finds terms that frequently appear together,
+    # which helps discover implicit relationships between concepts.
+    # =========================================================================
+    
+    def record_document_terms(self, terms: List[ExtractedTerm], file_path: str):
+        """
+        Record terms from a document for TF-IDF calculation.
+        
+        This must be called for each document BEFORE cross_reference() to ensure
+        accurate TF-IDF statistics.
+        
+        Args:
+            terms: List of terms extracted from this document
+            file_path: Path to the source document (for tracking)
+        """
+        self.total_documents += 1
+        
+        # Collect normalized terms for this document (deduplicated)
+        doc_terms = set()
+        for term in terms:
+            doc_terms.add(term.normalized)
+            term.term_frequency += 1  # Increment raw count
+        
+        # Store for later document frequency and co-occurrence calculation
+        self.document_term_sets.append(doc_terms)
+    
+    def calculate_tf_idf(self):
+        """
+        Calculate TF-IDF scores for all merged terms.
+        
+        TF-IDF Formula:
+            TF = 1 + log(term_frequency)  if term_frequency > 0, else 0
+            IDF = log(total_documents / (1 + document_frequency))
+            TF-IDF = TF × IDF
+        
+        Interpretation:
+            High TF-IDF: Term is frequent in few documents → distinctive
+            Low TF-IDF: Term is rare OR appears in many documents → less distinctive
+            
+        Called automatically by cross_reference() after merging terms.
+        """
+        import math
+        
+        if self.total_documents == 0:
+            return
+        
+        for term in self.merged_terms.values():
+            # Document Frequency (DF): count of documents containing this term
+            doc_count = sum(1 for doc_terms in self.document_term_sets 
+                           if term.normalized in doc_terms)
+            term.document_frequency = doc_count
+            
+            # Inverse Document Frequency (IDF)
+            # Higher IDF = more distinctive (appears in fewer documents)
+            # Add 1 to denominator to avoid division by zero for unseen terms
+            term.idf_score = math.log(self.total_documents / (1 + doc_count))
+            
+            # Term Frequency with logarithmic dampening
+            # This prevents very frequent terms from dominating
+            if term.term_frequency > 0:
+                tf = 1 + math.log(term.term_frequency)
+            else:
+                tf = 0
+            
+            # Combined TF-IDF score
+            term.tf_idf_score = tf * term.idf_score
+    
+    def calculate_co_occurrences(self):
+        """
+        Calculate which terms frequently appear together in the same documents.
+        
+        Co-occurrence is bidirectional: if A and B appear in the same document,
+        both A→B and B→A are recorded.
+        
+        Terms that co-occur in 2+ documents are added to each other's 
+        related_terms and a 'co_occurs_with' relationship is created.
+        
+        This helps discover implicit relationships like:
+        - "OFAC" and "sanctions" often appear together
+        - "MT-103" and "beneficiary" are related concepts
+        """
+        # Build co-occurrence matrix from document term sets
+        for doc_terms in self.document_term_sets:
+            term_list = list(doc_terms)
+            # Compare all pairs of terms in this document
+            for i, term1 in enumerate(term_list):
+                if term1 not in self.merged_terms:
+                    continue
+                for term2 in term_list[i+1:]:
+                    if term2 not in self.merged_terms:
+                        continue
+                    # Record bidirectional co-occurrence
+                    self.merged_terms[term1].co_occurrences[term2] = \
+                        self.merged_terms[term1].co_occurrences.get(term2, 0) + 1
+                    self.merged_terms[term2].co_occurrences[term1] = \
+                        self.merged_terms[term2].co_occurrences.get(term1, 0) + 1
+        
+        # Create relationships for significant co-occurrences
+        for term in self.merged_terms.values():
+            if term.co_occurrences:
+                # Get top 5 most frequently co-occurring terms
+                sorted_cooc = sorted(term.co_occurrences.items(), 
+                                    key=lambda x: -x[1])[:5]
+                for related_term, count in sorted_cooc:
+                    # Require at least 2 co-occurrences to create relationship
+                    # This filters out coincidental single-document co-occurrences
+                    if count >= 2:
+                        term.related_terms.add(related_term)
+                        self.relationships.append(Relationship(
+                            source_term=term.term,
+                            target_term=related_term,
+                            relationship_type='co_occurs_with',
+                            evidence=f"Co-occurred in {count} documents"
+                        ))
+    
+    def get_statistics(self) -> Dict:
+        """
+        Get comprehensive TF-IDF and term statistics.
+        
+        Returns a dictionary containing:
+        - total_documents: Number of documents processed
+        - total_terms: Number of unique terms
+        - terms_by_source: Breakdown by PDF/code/cross-referenced
+        - top_by_tf_idf: Most distinctive terms
+        - top_by_frequency: Most common terms
+        - top_by_document_frequency: Most universal terms
+        """
+        stats = {
+            'total_documents': self.total_documents,
+            'total_terms': len(self.merged_terms),
+            'terms_by_source': {
+                'pdf_only': len([t for t in self.merged_terms.values() if t.source == TermSource.PDF]),
+                'code_only': len([t for t in self.merged_terms.values() if t.source == TermSource.CODE]),
+                'cross_referenced': len([t for t in self.merged_terms.values() if t.source == TermSource.BOTH]),
+            },
+            'top_by_tf_idf': [],
+            'top_by_frequency': [],
+            'top_by_document_frequency': [],
+        }
+        
+        # Top terms by TF-IDF (most distinctive)
+        sorted_by_tfidf = sorted(self.merged_terms.values(), 
+                                 key=lambda t: -t.tf_idf_score)[:20]
+        stats['top_by_tf_idf'] = [
+            {'term': t.term, 'score': round(t.tf_idf_score, 3), 
+             'tf': t.term_frequency, 'df': t.document_frequency}
+            for t in sorted_by_tfidf
+        ]
+        
+        # Top terms by raw frequency
+        sorted_by_freq = sorted(self.merged_terms.values(),
+                               key=lambda t: -t.term_frequency)[:20]
+        stats['top_by_frequency'] = [
+            {'term': t.term, 'frequency': t.term_frequency}
+            for t in sorted_by_freq
+        ]
+        
+        # Top terms by document frequency (universal terms)
+        sorted_by_df = sorted(self.merged_terms.values(),
+                             key=lambda t: -t.document_frequency)[:20]
+        stats['top_by_document_frequency'] = [
+            {'term': t.term, 'doc_frequency': t.document_frequency,
+             'pct': round(t.document_frequency / max(1, self.total_documents) * 100, 1)}
+            for t in sorted_by_df
+        ]
+        
+        return stats
+    
+    # =========================================================================
     # CROSS-REFERENCING AND MERGING
     # =========================================================================
     
@@ -562,6 +1100,12 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
         # Find relationships between terms
         self._discover_relationships()
         
+        # Calculate TF-IDF scores
+        self.calculate_tf_idf()
+        
+        # Calculate co-occurrences
+        self.calculate_co_occurrences()
+        
         return self.merged_terms
     
     def _merge_terms(self, terms: List[ExtractedTerm]) -> ExtractedTerm:
@@ -579,11 +1123,15 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
             code_references=[]
         )
         
-        # Combine all sources and references
+        # Combine all sources, references, and statistics
         for term in terms:
             merged.source_files.extend(term.source_files)
             merged.code_references.extend(term.code_references)
             merged.related_terms.update(term.related_terms)
+            merged.term_frequency += term.term_frequency
+            # Merge co-occurrences
+            for co_term, count in term.co_occurrences.items():
+                merged.co_occurrences[co_term] = merged.co_occurrences.get(co_term, 0) + count
             if term.context and not merged.context:
                 merged.context = term.context
         
@@ -666,8 +1214,8 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
             if not terms:
                 continue
             
-            # Sort by confidence and source
-            terms.sort(key=lambda t: (-t.confidence, t.source.value))
+            # Sort by TF-IDF score first, then confidence
+            terms.sort(key=lambda t: (-t.tf_idf_score, -t.confidence, t.source.value))
             
             # Group into entries of ~5 keywords each
             for i in range(0, len(terms), 5):
@@ -677,6 +1225,11 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
                 for t in batch:
                     related.update(t.related_terms)
                 
+                # Calculate aggregate stats for the batch
+                avg_tfidf = sum(t.tf_idf_score for t in batch) / len(batch)
+                avg_df = sum(t.document_frequency for t in batch) / len(batch)
+                total_tf = sum(t.term_frequency for t in batch)
+                
                 entry = {
                     "keywords": ",".join(main_terms),
                     "metadata": category,
@@ -685,7 +1238,10 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
                     "business_capability": [category.replace('-', ' ').title()],
                     "_extracted": True,
                     "_source": "cross-referenced" if any(t.source == TermSource.BOTH for t in batch) else batch[0].source.value,
-                    "_confidence": sum(t.confidence for t in batch) / len(batch)
+                    "_confidence": round(sum(t.confidence for t in batch) / len(batch), 2),
+                    "_tf_idf_score": round(avg_tfidf, 3),
+                    "_term_frequency": total_tf,
+                    "_document_frequency": round(avg_df, 1)
                 }
                 
                 vocab['entries'].append(entry)
@@ -705,9 +1261,16 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
                 "label": term.term,
                 "type": term.term_type.value,
                 "source": term.source.value,
-                "confidence": term.confidence,
+                "confidence": round(term.confidence, 2),
                 "files": term.source_files[:5],
-                "context": term.context
+                "context": term.context,
+                # TF-IDF statistics
+                "tf_idf_score": round(term.tf_idf_score, 3),
+                "term_frequency": term.term_frequency,
+                "document_frequency": term.document_frequency,
+                # Top co-occurring terms
+                "co_occurs_with": [k for k, v in sorted(term.co_occurrences.items(), 
+                                                        key=lambda x: -x[1])[:5]]
             }
             nodes.append(node)
         
@@ -747,6 +1310,7 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
         print(f"Terms from Code: {len(self.code_terms)}")
         print(f"Merged terms: {len(self.merged_terms)}")
         print(f"Relationships: {len(self.relationships)}")
+        print(f"Documents processed: {self.total_documents}")
         
         # Count by source
         both = [t for t in self.merged_terms.values() if t.source == TermSource.BOTH]
@@ -760,8 +1324,31 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
         
         if both:
             print(f"\n⭐ Top Cross-Referenced Terms:")
-            for term in sorted(both, key=lambda t: -t.confidence)[:15]:
-                print(f"  • {term.term} ({term.term_type.value})")
+            for term in sorted(both, key=lambda t: -t.tf_idf_score)[:15]:
+                print(f"  • {term.term} (TF-IDF: {term.tf_idf_score:.3f}, DF: {term.document_frequency})")
+        
+        # TF-IDF Statistics
+        if self.merged_terms:
+            print(f"\n📈 TF-IDF Statistics:")
+            
+            # Top by TF-IDF (distinctive terms)
+            sorted_tfidf = sorted(self.merged_terms.values(), key=lambda t: -t.tf_idf_score)[:10]
+            print(f"\n  Top 10 by TF-IDF (distinctive terms):")
+            for t in sorted_tfidf:
+                print(f"    {t.term}: TF-IDF={t.tf_idf_score:.3f} (TF={t.term_frequency}, DF={t.document_frequency})")
+            
+            # Top by Document Frequency (universal terms)
+            sorted_df = sorted(self.merged_terms.values(), key=lambda t: -t.document_frequency)[:10]
+            print(f"\n  Top 10 by Doc Frequency (universal terms):")
+            for t in sorted_df:
+                pct = t.document_frequency / max(1, self.total_documents) * 100
+                print(f"    {t.term}: DF={t.document_frequency} ({pct:.0f}% of docs)")
+            
+            # Top by raw frequency
+            sorted_tf = sorted(self.merged_terms.values(), key=lambda t: -t.term_frequency)[:10]
+            print(f"\n  Top 10 by Raw Frequency:")
+            for t in sorted_tf:
+                print(f"    {t.term}: TF={t.term_frequency}")
         
         # Show relationship types
         rel_types = defaultdict(int)
@@ -770,7 +1357,7 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
         
         if rel_types:
             print(f"\n🔗 Relationships:")
-            for rel_type, count in rel_types.items():
+            for rel_type, count in sorted(rel_types.items(), key=lambda x: -x[1]):
                 print(f"  {rel_type}: {count}")
 
 
@@ -807,8 +1394,10 @@ def main():
                         help="Code source directory (TAL, COBOL, C, etc.)")
     parser.add_argument("--output", "-o", type=str, default="vocabulary_augmented.json",
                         help="Output vocabulary JSON path")
-    parser.add_argument("--graph", "-g", type=str, default=None,
-                        help="Output knowledge graph JSON path")
+    parser.add_argument("--graph", "-g", type=str, default="knowledge_graph.json",
+                        help="Output knowledge graph JSON path (default: knowledge_graph.json)")
+    parser.add_argument("--stats", "-s", type=str, default="term_statistics.json",
+                        help="Output TF-IDF statistics JSON path (default: term_statistics.json)")
     parser.add_argument("--existing", "-e", type=str, default="keywords.json",
                         help="Existing vocabulary to augment")
     parser.add_argument("--provider", "-p", type=str, default="tachyon",
@@ -851,8 +1440,23 @@ def main():
         for i, (file_path, ext) in enumerate(doc_files):
             print(f"  [{i+1}/{len(doc_files)}] {Path(file_path).name}...", end=" ", flush=True)
             terms = extractor.extract_from_pdf(file_path)
+            
+            # Record for TF-IDF
+            extractor.record_document_terms(terms, file_path)
+            
             for term in terms:
-                extractor.pdf_terms[term.normalized] = term
+                if term.normalized in extractor.pdf_terms:
+                    # Merge with existing - term appears in multiple docs (higher confidence)
+                    existing = extractor.pdf_terms[term.normalized]
+                    existing.source_files.extend(term.source_files)
+                    existing.source_files = list(set(existing.source_files))  # Dedupe
+                    existing.related_terms.update(term.related_terms)
+                    existing.term_frequency += term.term_frequency
+                    existing.confidence += 0.25  # Boost confidence for each additional doc
+                    if term.context and not existing.context:
+                        existing.context = term.context
+                else:
+                    extractor.pdf_terms[term.normalized] = term
             print(f"found {len(terms)} terms")
     
     # Find and process code files
@@ -865,12 +1469,19 @@ def main():
         for i, (file_path, ext) in enumerate(code_files):
             print(f"  [{i+1}/{len(code_files)}] {Path(file_path).name}...", end=" ", flush=True)
             terms = extractor.extract_from_code(file_path)
+            
+            # Record for TF-IDF
+            extractor.record_document_terms(terms, file_path)
+            
             for term in terms:
                 if term.normalized in extractor.code_terms:
-                    # Merge with existing
+                    # Merge with existing - term appears in multiple files
                     existing = extractor.code_terms[term.normalized]
                     existing.source_files.extend(term.source_files)
+                    existing.source_files = list(set(existing.source_files))  # Dedupe
                     existing.code_references.extend(term.code_references)
+                    existing.term_frequency += term.term_frequency
+                    existing.confidence += 0.1  # Small boost for each additional file
                 else:
                     extractor.code_terms[term.normalized] = term
             print(f"found {len(terms)} terms")
@@ -894,6 +1505,13 @@ def main():
         print(f"  Nodes: {graph['statistics']['total_nodes']}")
         print(f"  Edges: {graph['statistics']['total_edges']}")
     
+    if args.stats:
+        print(f"Generating TF-IDF statistics: {args.stats}")
+        stats = extractor.get_statistics()
+        with open(args.stats, 'w') as f:
+            json.dump(stats, f, indent=2)
+        print(f"  Total terms: {stats['total_terms']}")
+    
     # Print summary
     extractor.print_summary()
     
@@ -901,6 +1519,8 @@ def main():
     print(f"   Vocabulary: {args.output}")
     if args.graph:
         print(f"   Knowledge graph: {args.graph}")
+    if args.stats:
+        print(f"   TF-IDF statistics: {args.stats}")
 
 
 if __name__ == "__main__":
