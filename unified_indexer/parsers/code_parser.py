@@ -12,6 +12,7 @@ Handles common programming languages:
 - Rust (.rs)
 
 Provides basic function/method extraction and intelligent chunking.
+Includes call graph extraction for tracking function calls.
 """
 
 import re
@@ -28,6 +29,7 @@ from ..models import (
     SourceReference,
     DomainMatch
 )
+from ..call_graph import CallExtractor, extract_calls
 
 
 @dataclass
@@ -108,7 +110,11 @@ class GenericCodeParser(ContentParser):
     # Function patterns by language family
     FUNCTION_PATTERNS = {
         'c': [
+            # Standard single-line: int main(void) {
             r'^[\w\s\*]+\s+(\w+)\s*\([^)]*\)\s*\{',
+            # PostgreSQL style: return type on separate line
+            # void\nexec_simple_query(...)
+            r'^(\w+)\s*\([^)]*\)\s*$',
         ],
         'cpp': [
             r'^[\w\s\*\&<>:]+\s+(\w+::)?(\w+)\s*\([^)]*\)\s*(const)?\s*\{',
@@ -177,6 +183,7 @@ class GenericCodeParser(ContentParser):
         self.vocabulary = vocabulary
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.call_extractor = CallExtractor()
     
     def can_parse(self, file_path: str) -> bool:
         """Check if this parser can handle the file"""
@@ -241,6 +248,7 @@ class GenericCodeParser(ContentParser):
                         current_class = groups[-1]
             
             # Check for function definition
+            func_found = False
             for pattern in patterns:
                 match = re.match(pattern, line, re.MULTILINE)
                 if match:
@@ -249,6 +257,22 @@ class GenericCodeParser(ContentParser):
                     
                     if func_name and func_name not in ['if', 'for', 'while', 'switch', 'catch']:
                         start_line = i
+                        
+                        # For PostgreSQL-style (return type on previous line), 
+                        # check if brace is on next line
+                        if language in ('c', 'cpp') and '{' not in line:
+                            # Look for opening brace on next line(s)
+                            for j in range(i + 1, min(i + 3, len(lines))):
+                                if lines[j].strip() == '{':
+                                    break
+                                elif lines[j].strip().startswith('{'):
+                                    break
+                            # Also include return type from previous line if it exists
+                            if i > 0 and lines[i-1].strip() and not lines[i-1].strip().startswith(('/', '*', '#')):
+                                prev = lines[i-1].strip()
+                                if re.match(r'^[\w\s\*]+$', prev):
+                                    start_line = i - 1
+                        
                         end_line = self._find_block_end(lines, i, language)
                         
                         body_lines = lines[start_line:end_line + 1]
@@ -262,14 +286,19 @@ class GenericCodeParser(ContentParser):
                             body=body,
                             start_line=start_line + 1,
                             end_line=end_line + 1,
-                            language=language,
+                            docstring=docstring,
                             class_name=current_class,
-                            docstring=docstring
+                            language=language
                         ))
                         
                         i = end_line
+                        func_found = True
                         break
-            i += 1
+            
+            if not func_found:
+                i += 1
+            else:
+                i += 1
         
         return functions
     
@@ -395,6 +424,16 @@ class GenericCodeParser(ContentParser):
         if self.vocabulary:
             domain_matches = self.vocabulary.match_text(func.body, deduplicate=True)
         
+        # Extract function calls
+        call_infos = self.call_extractor.extract_calls(
+            func.body, language, procedure_name=func.name
+        )
+        calls = [c.target for c in call_infos]
+        
+        # Separate system calls from user calls
+        system_calls = [c.target for c in call_infos if c.call_type.value == 'system']
+        user_calls = [c.target for c in call_infos if c.call_type.value != 'system']
+        
         # Build metadata
         metadata = {
             'language': language,
@@ -406,6 +445,14 @@ class GenericCodeParser(ContentParser):
         if func.class_name:
             metadata['class_name'] = func.class_name
         
+        # Add call information
+        if calls:
+            metadata['calls'] = calls
+        if system_calls:
+            metadata['system_calls'] = system_calls
+        if user_calls:
+            metadata['user_calls'] = user_calls
+        
         # Create source reference
         source_ref = SourceReference(
             file_path=source_path,
@@ -414,7 +461,7 @@ class GenericCodeParser(ContentParser):
             procedure_name=func.full_name
         )
         
-        # Create embedding text
+        # Create embedding text - include calls for semantic matching
         embedding_parts = [
             f"Function: {func.full_name}",
             f"Language: {language}",
@@ -422,6 +469,8 @@ class GenericCodeParser(ContentParser):
         ]
         if func.docstring:
             embedding_parts.append(f"Documentation: {func.docstring[:500]}")
+        if user_calls:
+            embedding_parts.append(f"Calls: {', '.join(user_calls[:20])}")
         embedding_parts.append(func.body[:1000])
         embedding_text = '\n'.join(embedding_parts)
         

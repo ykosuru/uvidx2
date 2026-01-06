@@ -850,7 +850,7 @@ def create_provider(provider_name: str = "anthropic",
     Factory function to create LLM provider.
     
     Args:
-        provider_name: Provider name ("anthropic", "openai", "ollama", "internal", "stub")
+        provider_name: Provider name ("anthropic", "openai", "ollama", "internal", "tachyon", "stub")
         model: Model name (uses provider default if not specified)
         **kwargs: Additional provider arguments (base_url, api_key, etc.)
         
@@ -865,7 +865,8 @@ def create_provider(provider_name: str = "anthropic",
         return OpenAIProvider(model=model or "gpt-4", **kwargs)
     elif provider_name == "ollama":
         return OllamaProvider(model=model or "llama3", **kwargs)
-    elif provider_name == "internal":
+    elif provider_name in ("internal", "tachyon"):
+        # Tachyon is an alias for internal API provider
         return InternalAPIProvider(model=model or "gpt-4", **kwargs)
     elif provider_name == "stub":
         return StubLLMProvider(model=model or "stub-model", **kwargs)
@@ -1016,6 +1017,7 @@ def analyze_search_results(query: str,
                            min_score: float = 0.70,
                            max_chunks: int = 20,
                            system_prompt: Optional[str] = None,
+                           custom_context: Optional[str] = None,
                            verbose: bool = False) -> LLMResponse:
     """
     Analyze search results using LLM.
@@ -1027,15 +1029,20 @@ def analyze_search_results(query: str,
         min_score: Minimum score threshold for including results
         max_chunks: Maximum number of chunks to include
         system_prompt: Custom system prompt (uses default if None)
+        custom_context: Custom pre-formatted context (replaces auto-formatting if provided)
         verbose: Print debug information
         
     Returns:
         LLMResponse with analysis
     """
-    # Format results
-    context_text, image_items = format_search_results_for_llm(
-        results, min_score, max_chunks, include_images=True
-    )
+    # Use custom context if provided, otherwise format results
+    if custom_context:
+        context_text = custom_context
+        image_items = []  # Custom context doesn't include images yet
+    else:
+        context_text, image_items = format_search_results_for_llm(
+            results, min_score, max_chunks, include_images=True
+        )
     
     if verbose:
         print(f"\n📄 Context length: {len(context_text)} characters")
@@ -1043,7 +1050,7 @@ def analyze_search_results(query: str,
         print(f"🖼️  Images found: {len(image_items)}")
     
     # Check for empty results
-    if "No results found" in context_text:
+    if "No results found" in context_text or not context_text.strip():
         return LLMResponse(
             content=f"No search results found with score >= {min_score}. Try lowering the threshold or broadening your query.",
             model=provider.model,
@@ -1063,6 +1070,7 @@ RELEVANT ARTIFACTS:
 
 Please analyze the above artifacts and provide a comprehensive answer to the user's query. 
 Extract implementation details, business rules, and any relevant technical information.
+Pay attention to the execution flow and call relationships between procedures.
 If there are images referenced, describe what you see in them."""
     
     # Determine content type

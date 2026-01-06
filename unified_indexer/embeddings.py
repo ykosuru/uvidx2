@@ -412,24 +412,26 @@ class DomainConceptEmbedder:
         
         # Add canonical terms
         for entry in self.domain_vocab.entries:
-            if entry.canonical_term not in self.concept_to_idx:
-                self.concept_to_idx[entry.canonical_term.lower()] = idx
+            term_lower = entry.canonical_term.lower()
+            if term_lower not in self.concept_to_idx:
+                self.concept_to_idx[term_lower] = idx
                 idx += 1
         
         # Add capabilities
         if self.include_capabilities:
             for entry in self.domain_vocab.entries:
                 for cap in entry.business_capabilities:
-                    if cap.lower() not in self.concept_to_idx:
-                        self.concept_to_idx[cap.lower()] = idx
+                    cap_lower = cap.lower()
+                    if cap_lower not in self.concept_to_idx:
+                        self.concept_to_idx[cap_lower] = idx
                         idx += 1
         
         # Add categories
         if self.include_categories:
             for entry in self.domain_vocab.entries:
-                cat = entry.metadata_category.lower()
-                if cat not in self.concept_to_idx:
-                    self.concept_to_idx[cat] = idx
+                cat_lower = entry.metadata_category.lower()
+                if cat_lower not in self.concept_to_idx:
+                    self.concept_to_idx[cat_lower] = idx
                     idx += 1
     
     @property
@@ -765,48 +767,9 @@ def create_embedder(
             text_weight=kwargs.get('text_weight', 0.3)
         )
     
-    elif embedder_type == "learned":
-        from .learned_embeddings import LearnedDomainEmbedder
-        dimensions_path = kwargs.get('dimensions_path')
-        vocabulary_entries = kwargs.get('vocabulary_entries')
-        
-        if dimensions_path:
-            embedder = LearnedDomainEmbedder.load(dimensions_path)
-            # Inject vocabulary if provided
-            if vocabulary_entries:
-                embedder.inject_vocabulary(vocabulary_entries, verbose=False)
-            return embedder
-        else:
-            # Return unfitted embedder - must call fit() before use
-            from .learned_embeddings import LearningConfig
-            config = LearningConfig(
-                n_dimensions=kwargs.get('n_dimensions', 80),
-                min_term_frequency=kwargs.get('min_term_frequency', 3)
-            )
-            return LearnedDomainEmbedder(config)
-    
-    elif embedder_type == "learned_hybrid":
-        from .learned_embeddings import LearnedDomainEmbedder, HybridLearnedEmbedder
-        dimensions_path = kwargs.get('dimensions_path')
-        vocabulary_entries = kwargs.get('vocabulary_entries')
-        
-        if not dimensions_path:
-            raise ValueError("dimensions_path required for learned_hybrid embedder")
-        
-        learned = LearnedDomainEmbedder.load(dimensions_path)
-        # Inject vocabulary if provided
-        if vocabulary_entries:
-            learned.inject_vocabulary(vocabulary_entries, verbose=False)
-            
-        return HybridLearnedEmbedder(
-            learned_embedder=learned,
-            text_dim=kwargs.get('text_dim', 512),
-            learned_weight=kwargs.get('learned_weight', 0.7),
-            text_weight=kwargs.get('text_weight', 0.3)
-        )
-    
     else:
-        raise ValueError(f"Unknown embedder type: {embedder_type}")
+        raise ValueError(f"Unknown embedder type: {embedder_type}. "
+                        f"Valid types: hash, hybrid, tfidf, domain, bm25, payment, payment_hybrid")
 
 
 # ============================================================

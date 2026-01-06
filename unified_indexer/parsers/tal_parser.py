@@ -19,6 +19,7 @@ from ..models import (
     DomainMatch
 )
 from ..vocabulary import DomainVocabulary
+from ..call_graph import CallExtractor, extract_calls
 
 
 class TalCodeParser(ContentParser):
@@ -44,6 +45,7 @@ class TalCodeParser(ContentParser):
         
         self.tal_proc_parser = None
         self.tal_enhanced_parser = None
+        self.call_extractor = CallExtractor()
         
         # Try to import the TAL parsers
         self._load_tal_parsers(tal_parser_path)
@@ -334,15 +336,26 @@ class TalCodeParser(ContentParser):
         if return_type:
             metadata['return_type'] = return_type
         
-        # Extract called procedures if AST available
+        # Extract called procedures
+        calls = []
+        system_funcs = []
+        
         if ast_node:
+            # Use AST-based extraction
             calls = self._extract_procedure_calls(ast_node)
-            if calls:
-                metadata['calls'] = calls
-            
             system_funcs = self._extract_system_functions(ast_node)
-            if system_funcs:
-                metadata['system_functions'] = system_funcs
+        else:
+            # Use regex-based extraction as fallback
+            call_infos = self.call_extractor.extract_calls(
+                proc_text, 'tal', procedure_name=proc_name
+            )
+            calls = [c.target for c in call_infos if c.call_type.value != 'system']
+            system_funcs = [c.target for c in call_infos if c.call_type.value == 'system']
+        
+        if calls:
+            metadata['calls'] = calls
+        if system_funcs:
+            metadata['system_functions'] = system_funcs
         
         # Create source reference
         source_ref = SourceReference(
@@ -352,13 +365,17 @@ class TalCodeParser(ContentParser):
             procedure_name=proc_name
         )
         
-        # Create embedding text
+        # Create embedding text - include calls for semantic matching
         embedding_text = self.create_embedding_text(
             proc_text,
             SemanticType.PROCEDURE,
             domain_matches,
             metadata
         )
+        
+        # Add calls to embedding text if present
+        if calls:
+            embedding_text += f"\nCalls: {', '.join(calls[:20])}"
         
         return IndexableChunk(
             chunk_id=self.generate_chunk_id(source_path, proc_text, proc_name),

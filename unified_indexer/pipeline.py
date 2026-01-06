@@ -5,10 +5,9 @@ Provides a unified interface for indexing code, documents, and logs
 together with a shared domain vocabulary.
 """
 
-import os
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Callable, Generator
+from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,14 +20,7 @@ from .parsers.document_parser import DocumentParser
 from .parsers.log_parser import LogParser
 from .parsers.code_parser import GenericCodeParser
 from .index import HybridIndex
-from .embeddings import (
-    create_embedder,
-    HybridEmbedder,
-    TFIDFEmbedder,
-    HashEmbedder,
-    DomainConceptEmbedder,
-    BM25Embedder
-)
+from .embeddings import create_embedder
 
 
 @dataclass
@@ -425,8 +417,11 @@ class IndexingPipeline:
         Returns:
             List of created chunks
         """
-        # Determine parser
-        if source_type:
+        # Determine parser - for code files, check file extension to pick right parser
+        if source_type == SourceType.CODE:
+            # Use file extension to select appropriate code parser
+            parser = self.get_parser_for_file(source_path)
+        elif source_type:
             parser = self.parsers.get(source_type)
         else:
             parser = self.get_parser_for_file(source_path)
@@ -440,6 +435,13 @@ class IndexingPipeline:
         for chunk in chunks:
             self.index.index_chunk(chunk)
         
+        # Update statistics
+        if chunks:
+            self.stats.files_processed += 1
+            self.stats.total_chunks += len(chunks)
+            source_type_key = chunks[0].source_type.value if chunks[0].source_type else 'unknown'
+            self.stats.by_source_type[source_type_key] = self.stats.by_source_type.get(source_type_key, 0) + len(chunks)
+        
         return chunks
     
     def search(self, 
@@ -447,16 +449,18 @@ class IndexingPipeline:
                top_k: int = 10,
                source_types: Optional[List[SourceType]] = None,
                capabilities: Optional[List[str]] = None,
-               keyword_fallback_threshold: float = 0.3) -> List[SearchResult]:
+               use_rrf: bool = True,
+               rrf_k: int = 60) -> List[SearchResult]:
         """
-        Search the index
+        Search the index using hybrid retrieval (vector + BM25 + concept).
         
         Args:
             query: Search query
             top_k: Number of results
             source_types: Filter by source types
             capabilities: Filter by business capabilities
-            keyword_fallback_threshold: Boost keyword search when vector scores below this
+            use_rrf: Use Reciprocal Rank Fusion (default: True)
+            rrf_k: RRF constant (default: 60)
             
         Returns:
             List of SearchResult objects
@@ -466,7 +470,8 @@ class IndexingPipeline:
             top_k=top_k,
             source_types=source_types,
             capabilities=capabilities,
-            keyword_fallback_threshold=keyword_fallback_threshold
+            use_rrf=use_rrf,
+            rrf_k=rrf_k
         )
     
     def search_cross_reference(self,
@@ -550,14 +555,15 @@ class IndexingPipeline:
         """
         return self.index.search_by_capability(capability, top_k)
     
-    def save(self, directory: str):
+    def save(self, directory: str, verbose: bool = False):
         """
         Save the index to disk
         
         Args:
             directory: Directory to save index
+            verbose: If True, print detailed generation logging
         """
-        self.index.save(directory)
+        self.index.save(directory, verbose=verbose)
         
         # Also save vocabulary and metadata
         path = Path(directory)
@@ -601,14 +607,15 @@ class IndexingPipeline:
                 'saved_at': datetime.now().isoformat()
             }, f, indent=2)
     
-    def load(self, directory: str):
+    def load(self, directory: str, verbose: bool = False):
         """
         Load the index from disk
         
         Args:
             directory: Directory containing saved index
+            verbose: If True, print detailed generation logging
         """
-        self.index.load(directory)
+        self.index.load(directory, verbose=verbose)
         
         path = Path(directory)
         

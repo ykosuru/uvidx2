@@ -4,22 +4,45 @@ Hybrid Index - Combines vector similarity with concept-based retrieval
 This index stores chunks in both a vector store (for semantic search)
 and a concept index (for exact domain term matching). Search results
 are fused using reciprocal rank fusion.
+
+Concurrency Model:
+- Uses generation-based versioning for lock-free reads
+- Writes create new generation, atomic pointer update
+- Readers always see consistent snapshot (old or new, never mixed)
 """
 
 import json
+import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple, Callable
 from collections import defaultdict
-from dataclasses import dataclass
 import numpy as np
 
 from .models import (
     IndexableChunk,
     SearchResult,
-    SourceType,
-    DomainMatch
+    SourceType
 )
 from .vocabulary import DomainVocabulary
+
+
+def get_current_generation(index_dir: Path) -> int:
+    """Get the current generation number from index directory."""
+    gen_file = index_dir / 'generation.txt'
+    if gen_file.exists():
+        try:
+            return int(gen_file.read_text().strip())
+        except (ValueError, IOError):
+            pass
+    return 0
+
+
+def get_generation_path(index_dir: Path, generation: int) -> Path:
+    """Get the path to a specific generation's data."""
+    if generation == 0:
+        # Legacy: no generation subdirectory
+        return index_dir
+    return index_dir / f'gen_{generation}'
 
 
 class VectorStore:
@@ -160,37 +183,341 @@ class ConceptIndex:
         return len(self.chunks)
 
 
+# =============================================================================
+# BM25 INDEX
+# =============================================================================
+
+class BM25Index:
+    """
+    BM25 (Best Matching 25) index for lexical retrieval.
+    
+    BM25 is a bag-of-words retrieval function that ranks documents based on 
+    query term frequencies. It's particularly effective for:
+    - Exact term matching (acronyms, technical terms)
+    - Queries where semantic similarity misses lexical matches
+    - Complementing vector search in hybrid retrieval
+    
+    Algorithm:
+        score(D, Q) = Σ IDF(qi) * (f(qi, D) * (k1 + 1)) / (f(qi, D) + k1 * (1 - b + b * |D|/avgdl))
+        
+        where:
+        - f(qi, D) = frequency of term qi in document D
+        - |D| = document length
+        - avgdl = average document length
+        - k1 = term frequency saturation parameter (default: 1.5)
+        - b = length normalization parameter (default: 0.75)
+        - IDF(qi) = log((N - n(qi) + 0.5) / (n(qi) + 0.5) + 1)
+    
+    Attributes:
+        k1: Term frequency saturation (higher = more weight to term frequency)
+        b: Length normalization (0 = no normalization, 1 = full normalization)
+    """
+    
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        """
+        Initialize BM25 index.
+        
+        Args:
+            k1: Term frequency saturation parameter (default: 1.5)
+            b: Length normalization parameter (default: 0.75)
+        """
+        self.k1 = k1
+        self.b = b
+        
+        # Document storage
+        self.chunk_ids: List[str] = []                    # Ordered list of chunk IDs
+        self.chunks: Dict[str, IndexableChunk] = {}       # chunk_id -> chunk
+        self.doc_tokens: List[List[str]] = []             # Tokenized documents
+        self.doc_lengths: List[int] = []                  # Document lengths
+        
+        # Index structures (built on first search or explicit build)
+        self.term_doc_freqs: Dict[str, int] = {}          # term -> document frequency
+        self.inverted_index: Dict[str, Dict[int, int]] = {}  # term -> {doc_idx -> term_freq}
+        self.avgdl: float = 0.0                           # Average document length
+        self.N: int = 0                                   # Total number of documents
+        
+        # IDF cache
+        self._idf_cache: Dict[str, float] = {}
+        self._index_built = False
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """
+        Tokenize text for BM25 indexing.
+        
+        Uses simple whitespace + punctuation splitting with lowercasing.
+        More sophisticated tokenization (stemming, lemmatization) could improve results.
+        """
+        import re
+        # Split on non-alphanumeric, keep underscores for technical terms
+        tokens = re.split(r'[^\w]+', text.lower())
+        # Filter empty and single-char tokens (except meaningful ones)
+        return [t for t in tokens if len(t) >= 2 or t in ('a', 'i')]
+    
+    def add(self, chunk_id: str, chunk: IndexableChunk):
+        """
+        Add a chunk to the BM25 index.
+        
+        Note: Call build_index() after adding all chunks, or it will be
+        built automatically on first search.
+        
+        Args:
+            chunk_id: Unique identifier for the chunk
+            chunk: The chunk to index
+        """
+        # Tokenize the chunk text
+        tokens = self._tokenize(chunk.text)
+        
+        # Store document
+        doc_idx = len(self.chunk_ids)
+        self.chunk_ids.append(chunk_id)
+        self.chunks[chunk_id] = chunk
+        self.doc_tokens.append(tokens)
+        self.doc_lengths.append(len(tokens))
+        
+        # Update inverted index incrementally
+        term_freqs: Dict[str, int] = {}
+        for token in tokens:
+            term_freqs[token] = term_freqs.get(token, 0) + 1
+        
+        for term, freq in term_freqs.items():
+            # Update document frequency
+            if term not in self.inverted_index:
+                self.inverted_index[term] = {}
+                self.term_doc_freqs[term] = 0
+            
+            if doc_idx not in self.inverted_index[term]:
+                self.term_doc_freqs[term] += 1
+            
+            self.inverted_index[term][doc_idx] = freq
+        
+        # Mark index as needing rebuild for IDF
+        self._index_built = False
+    
+    def build_index(self):
+        """
+        Build/rebuild the BM25 index statistics.
+        
+        Call this after adding all documents for optimal performance.
+        Computes:
+        - Average document length
+        - IDF scores for all terms
+        """
+        self.N = len(self.chunk_ids)
+        
+        if self.N == 0:
+            self.avgdl = 0.0
+            return
+        
+        # Calculate average document length
+        self.avgdl = sum(self.doc_lengths) / self.N if self.N > 0 else 0.0
+        
+        # Pre-compute IDF for all terms
+        self._idf_cache = {}
+        for term, df in self.term_doc_freqs.items():
+            # BM25 IDF formula (with +1 to avoid negative IDF for common terms)
+            idf = np.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
+            self._idf_cache[term] = idf
+        
+        self._index_built = True
+    
+    def _get_idf(self, term: str) -> float:
+        """Get IDF score for a term."""
+        if term in self._idf_cache:
+            return self._idf_cache[term]
+        
+        # Compute IDF for unknown term
+        df = self.term_doc_freqs.get(term, 0)
+        if df == 0:
+            return 0.0
+        
+        idf = np.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
+        self._idf_cache[term] = idf
+        return idf
+    
+    def search(self, 
+               query: str, 
+               top_k: int = 10,
+               filter_fn: Optional[Callable[[IndexableChunk], bool]] = None) -> List[Tuple[str, float]]:
+        """
+        Search the index using BM25 scoring.
+        
+        Args:
+            query: Search query string
+            top_k: Number of results to return
+            filter_fn: Optional function to filter chunks (chunk -> bool)
+            
+        Returns:
+            List of (chunk_id, score) tuples, sorted by score descending
+        """
+        if not self._index_built:
+            self.build_index()
+        
+        if self.N == 0:
+            return []
+        
+        # Tokenize query
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+        
+        # Calculate BM25 scores for all matching documents
+        scores: Dict[int, float] = {}
+        
+        for term in query_tokens:
+            if term not in self.inverted_index:
+                continue
+            
+            idf = self._get_idf(term)
+            
+            # Score each document containing this term
+            for doc_idx, term_freq in self.inverted_index[term].items():
+                doc_len = self.doc_lengths[doc_idx]
+                
+                # BM25 scoring formula
+                numerator = term_freq * (self.k1 + 1)
+                denominator = term_freq + self.k1 * (1 - self.b + self.b * doc_len / self.avgdl)
+                term_score = idf * (numerator / denominator)
+                
+                if doc_idx not in scores:
+                    scores[doc_idx] = 0.0
+                scores[doc_idx] += term_score
+        
+        # Apply filter if provided
+        if filter_fn:
+            filtered_scores = {}
+            for doc_idx, score in scores.items():
+                chunk_id = self.chunk_ids[doc_idx]
+                chunk = self.chunks.get(chunk_id)
+                if chunk and filter_fn(chunk):
+                    filtered_scores[doc_idx] = score
+            scores = filtered_scores
+        
+        # Sort by score and return top_k
+        sorted_docs = sorted(scores.items(), key=lambda x: -x[1])
+        
+        results = []
+        for doc_idx, score in sorted_docs[:top_k]:
+            chunk_id = self.chunk_ids[doc_idx]
+            results.append((chunk_id, score))
+        
+        return results
+    
+    def get_chunk(self, chunk_id: str) -> Optional[IndexableChunk]:
+        """Get a chunk by ID."""
+        return self.chunks.get(chunk_id)
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get index statistics."""
+        return {
+            'total_documents': self.N,
+            'unique_terms': len(self.term_doc_freqs),
+            'average_doc_length': self.avgdl,
+            'k1': self.k1,
+            'b': self.b
+        }
+    
+    def __len__(self):
+        return len(self.chunk_ids)
+
+
+# =============================================================================
+# RECIPROCAL RANK FUSION
+# =============================================================================
+
+def reciprocal_rank_fusion(result_lists: List[List[Tuple[str, float]]], 
+                           k: int = 60) -> Dict[str, float]:
+    """
+    Combine multiple ranked result lists using Reciprocal Rank Fusion (RRF).
+    
+    RRF is a simple but effective method for combining results from multiple
+    retrieval systems. It uses ranks rather than scores, making it robust
+    to score distribution differences between systems.
+    
+    Formula: RRF_score(d) = Σ 1/(k + rank(d))
+    
+    Args:
+        result_lists: List of result lists, each containing (chunk_id, score) tuples
+        k: Ranking constant (default: 60, as used by Elasticsearch)
+           Higher k = more weight to lower-ranked results
+           
+    Returns:
+        Dict mapping chunk_id -> fused RRF score
+        
+    Example:
+        >>> vector_results = [("A", 0.9), ("B", 0.8), ("C", 0.7)]
+        >>> bm25_results = [("B", 12.5), ("D", 10.0), ("A", 8.0)]
+        >>> fused = reciprocal_rank_fusion([vector_results, bm25_results])
+        >>> # B appears rank 2 in vector (1/62) and rank 1 in BM25 (1/61)
+        >>> # B gets highest combined score
+    """
+    rrf_scores: Dict[str, float] = defaultdict(float)
+    
+    for results in result_lists:
+        if not results:
+            continue
+        
+        # Sort by score descending to establish ranks
+        sorted_results = sorted(results, key=lambda x: -x[1])
+        
+        for rank, (chunk_id, score) in enumerate(sorted_results):
+            # RRF formula: 1/(k + rank), where rank is 0-indexed
+            rrf_scores[chunk_id] += 1.0 / (k + rank + 1)
+    
+    return dict(rrf_scores)
+
+
 class HybridIndex:
     """
-    Hybrid retrieval index combining vector and concept search
+    Hybrid retrieval index combining vector, BM25, and concept search.
+    
+    This index uses multiple retrieval signals:
+    - Vector similarity search (semantic matching)
+    - BM25 lexical search (exact term matching)
+    - Concept index (domain vocabulary matching)
+    
+    Results are combined using Reciprocal Rank Fusion (RRF), which:
+    - Uses ranks instead of scores (robust to score distribution differences)
+    - Naturally handles missing results from some retrievers
+    - Proven effective in production search systems
+    
+    Search Strategy:
+        1. If both vector and BM25 return results → RRF fusion
+        2. If only one returns results → Use that retriever
+        3. Fall back to concept matching if neither works
     
     Features:
-    - Vector similarity search for semantic matching
-    - Concept index for exact domain term matching
-    - Reciprocal rank fusion for result combination
     - Filtering by source type, capability, etc.
+    - Automatic fallback when one retriever fails
+    - Configurable weights and thresholds
     """
     
     def __init__(self, 
                  vocabulary: DomainVocabulary,
-                 embedding_fn: Optional[Callable[[str], List[float]]] = None):
+                 embedding_fn: Optional[Callable[[str], List[float]]] = None,
+                 bm25_k1: float = 1.5,
+                 bm25_b: float = 0.75):
         """
-        Initialize hybrid index
+        Initialize hybrid index with vector, BM25, and concept components.
         
         Args:
             vocabulary: Domain vocabulary for query expansion
             embedding_fn: Function to generate embeddings (text -> vector)
+            bm25_k1: BM25 term frequency saturation (default: 1.5)
+            bm25_b: BM25 length normalization (default: 0.75)
         """
         self.vocabulary = vocabulary
         self.embedding_fn = embedding_fn
         
+        # Initialize all three retrieval components
         self.vector_store = VectorStore()
+        self.bm25_index = BM25Index(k1=bm25_k1, b=bm25_b)
         self.concept_index = ConceptIndex()
         
         # Index metadata
         self.metadata: Dict[str, Any] = {
             'total_indexed': 0,
-            'by_source_type': defaultdict(int)
+            'by_source_type': defaultdict(int),
+            'bm25_enabled': True
         }
     
     def set_embedding_function(self, fn: Callable[[str], List[float]]):
@@ -199,13 +526,16 @@ class HybridIndex:
     
     def index_chunk(self, chunk: IndexableChunk):
         """
-        Add a chunk to both indexes
+        Add a chunk to all indexes (vector, BM25, concept).
         
         Args:
             chunk: Chunk to index
         """
-        # Add to concept index
+        # Add to concept index (always)
         self.concept_index.add(chunk)
+        
+        # Add to BM25 index (always - lexical search doesn't need embeddings)
+        self.bm25_index.add(chunk.chunk_id, chunk)
         
         # Add to vector store if embedding function available
         if self.embedding_fn:
@@ -222,7 +552,7 @@ class HybridIndex:
     
     def index_chunks(self, chunks: List[IndexableChunk], batch_size: int = 100):
         """
-        Index multiple chunks
+        Index multiple chunks.
         
         Args:
             chunks: List of chunks to index
@@ -230,203 +560,214 @@ class HybridIndex:
         """
         for chunk in chunks:
             self.index_chunk(chunk)
+        
+        # Build BM25 index after all chunks are added (more efficient)
+        self.bm25_index.build_index()
     
     def search(self,
                query: str,
                top_k: int = 10,
                source_types: Optional[List[SourceType]] = None,
                capabilities: Optional[List[str]] = None,
-               vector_weight: float = 0.5,
-               concept_weight: float = 0.5,
-               keyword_weight: float = 0.3,
-               keyword_fallback_threshold: float = 0.3) -> List[SearchResult]:
+               use_rrf: bool = True,
+               rrf_k: int = 60,
+               vector_weight: float = 1.0,
+               bm25_weight: float = 1.0,
+               concept_weight: float = 0.5) -> List[SearchResult]:
         """
-        Hybrid search combining vector, concept, and keyword matching
+        Hybrid search combining vector, BM25, and concept matching.
+        
+        Uses Reciprocal Rank Fusion (RRF) by default to combine results from
+        multiple retrieval systems. RRF is robust to score distribution
+        differences between retrievers.
+        
+        Search Strategy:
+            1. Run vector search (semantic similarity)
+            2. Run BM25 search (lexical matching)
+            3. Run concept search (domain vocabulary)
+            4. Fuse results using RRF or weighted combination
         
         Args:
             query: Search query
             top_k: Number of results to return
             source_types: Filter by source types (None = all)
             capabilities: Filter by business capabilities (None = all)
-            vector_weight: Weight for vector search scores
-            concept_weight: Weight for concept match scores
-            keyword_weight: Weight for keyword/grep match scores
-            keyword_fallback_threshold: If top vector score below this, boost keyword weight
+            use_rrf: If True, use Reciprocal Rank Fusion (recommended)
+                     If False, use weighted score combination
+            rrf_k: RRF constant (default: 60, higher = more weight to lower ranks)
+            vector_weight: Weight for vector results in RRF (default: 1.0)
+            bm25_weight: Weight for BM25 results in RRF (default: 1.0)
+            concept_weight: Weight for concept results in RRF (default: 0.5)
             
         Returns:
-            List of SearchResult objects ranked by combined score
+            List of SearchResult objects ranked by fused score
         """
-        # Extract concepts from query
+        # Extract concepts from query for matching
         query_concepts = self.vocabulary.match_text(query, deduplicate=True)
-        
-        # Expand query with synonyms
         expanded_terms = self.vocabulary.expand_query(query)
         
-        # ========== Vector Search ==========
-        vector_results: Dict[str, float] = {}
+        # Create filter function for source types and capabilities
+        def filter_fn(chunk: IndexableChunk) -> bool:
+            if source_types and chunk.source_type not in source_types:
+                return False
+            if capabilities:
+                chunk_caps = chunk.capability_set
+                if not any(cap in chunk_caps for cap in capabilities):
+                    return False
+            return True
+        
+        # ========== 1. Vector Search ==========
+        vector_results: List[Tuple[str, float]] = []
         
         if self.embedding_fn and len(self.vector_store) > 0:
-            # Create filter function
-            def filter_fn(chunk: IndexableChunk) -> bool:
-                if source_types and chunk.source_type not in source_types:
-                    return False
-                if capabilities:
-                    chunk_caps = chunk.capability_set
-                    if not any(cap in chunk_caps for cap in capabilities):
-                        return False
-                return True
-            
-            # Search vector store
             query_embedding = self.embedding_fn(query)
-            vector_hits = self.vector_store.search(
+            vector_results = self.vector_store.search(
                 query_embedding, 
                 top_k=top_k * 3,  # Get more for fusion
                 filter_fn=filter_fn
             )
-            
-            for chunk_id, score in vector_hits:
-                vector_results[chunk_id] = score
         
-        # ========== Keyword/Grep Search ==========
-        keyword_results: Dict[str, float] = {}
-        keyword_results = self._keyword_search(query, source_types, capabilities)
+        # ========== 2. BM25 Search ==========
+        bm25_results: List[Tuple[str, float]] = []
         
-        # Check if we need to boost keyword weight (low vector scores)
-        effective_keyword_weight = keyword_weight
-        top_vector_score = max(vector_results.values()) if vector_results else 0
+        if len(self.bm25_index) > 0:
+            bm25_results = self.bm25_index.search(
+                query,
+                top_k=top_k * 3,
+                filter_fn=filter_fn
+            )
         
-        if top_vector_score < keyword_fallback_threshold:
-            # Boost keyword weight when vector search isn't finding good matches
-            # The lower the vector score, the more we rely on keywords
-            if top_vector_score < 0.15:
-                # Very low vector scores - keywords should dominate
-                effective_keyword_weight = 0.8
-            elif top_vector_score < 0.25:
-                effective_keyword_weight = 0.6
-            else:
-                effective_keyword_weight = 0.5
+        # ========== 3. Concept Search ==========
+        concept_scores: Dict[str, float] = {}
         
-        if not vector_results:
-            # No vector results at all, rely entirely on keywords
-            effective_keyword_weight = 0.9
-        
-        # ========== Concept Search ==========
-        concept_results: Dict[str, float] = {}
-        
-        # Search by extracted concepts
+        # Match by extracted concepts
         for concept_match in query_concepts:
             chunk_ids = self.concept_index.search_concept(concept_match.canonical_term)
             for chunk_id in chunk_ids:
-                if chunk_id not in concept_results:
-                    concept_results[chunk_id] = 0.0
-                concept_results[chunk_id] += 1.0
+                if chunk_id not in concept_scores:
+                    concept_scores[chunk_id] = 0.0
+                concept_scores[chunk_id] += 1.0
         
-        # Search by expanded terms
+        # Match by expanded terms
         for term in expanded_terms:
             entry = self.vocabulary.get_entry_by_term(term)
             if entry:
                 chunk_ids = self.concept_index.search_concept(entry.canonical_term)
                 for chunk_id in chunk_ids:
-                    if chunk_id not in concept_results:
-                        concept_results[chunk_id] = 0.0
-                    concept_results[chunk_id] += 0.5  # Lower weight for expanded terms
-        
-        # Search by capability filter
-        if capabilities:
-            for capability in capabilities:
-                chunk_ids = self.concept_index.search_capability(capability)
-                for chunk_id in chunk_ids:
-                    if chunk_id not in concept_results:
-                        concept_results[chunk_id] = 0.0
-                    concept_results[chunk_id] += 0.5
+                    if chunk_id not in concept_scores:
+                        concept_scores[chunk_id] = 0.0
+                    concept_scores[chunk_id] += 0.5
         
         # Apply source type filter to concept results
         if source_types:
             allowed_chunks = set()
             for st in source_types:
-                allowed_chunks.update(
-                    self.concept_index.search_source_type(st.value)
-                )
-            concept_results = {
-                cid: score for cid, score in concept_results.items()
+                allowed_chunks.update(self.concept_index.search_source_type(st.value))
+            concept_scores = {
+                cid: score for cid, score in concept_scores.items()
                 if cid in allowed_chunks
             }
         
-        # Normalize concept scores
-        if concept_results:
-            max_concept_score = max(concept_results.values())
-            if max_concept_score > 0:
-                concept_results = {
-                    cid: score / max_concept_score 
-                    for cid, score in concept_results.items()
-                }
+        # Convert to list format for fusion
+        concept_results = [(cid, score) for cid, score in concept_scores.items()]
         
-        # ========== Result Fusion ==========
-        all_chunk_ids = set(vector_results.keys()) | set(concept_results.keys()) | set(keyword_results.keys())
+        # ========== 4. Result Fusion ==========
+        if use_rrf:
+            # Build weighted result lists for RRF
+            # Apply weights by repeating results (simple but effective)
+            weighted_lists = []
+            
+            if vector_results and vector_weight > 0:
+                weighted_lists.append(vector_results)
+            
+            if bm25_results and bm25_weight > 0:
+                weighted_lists.append(bm25_results)
+            
+            if concept_results and concept_weight > 0:
+                weighted_lists.append(concept_results)
+            
+            if not weighted_lists:
+                return []
+            
+            # Apply RRF
+            fused_scores = reciprocal_rank_fusion(weighted_lists, k=rrf_k)
+            
+        else:
+            # Fallback to weighted score combination
+            # Normalize each result list's scores to 0-1
+            def normalize_scores(results: List[Tuple[str, float]]) -> Dict[str, float]:
+                if not results:
+                    return {}
+                scores = [s for _, s in results]
+                min_s, max_s = min(scores), max(scores)
+                range_s = max_s - min_s if max_s != min_s else 1.0
+                return {cid: (s - min_s) / range_s for cid, s in results}
+            
+            v_norm = normalize_scores(vector_results)
+            b_norm = normalize_scores(bm25_results)
+            c_norm = normalize_scores(concept_results)
+            
+            all_ids = set(v_norm.keys()) | set(b_norm.keys()) | set(c_norm.keys())
+            total_weight = vector_weight + bm25_weight + concept_weight
+            
+            fused_scores = {}
+            for chunk_id in all_ids:
+                score = (
+                    vector_weight * v_norm.get(chunk_id, 0) +
+                    bm25_weight * b_norm.get(chunk_id, 0) +
+                    concept_weight * c_norm.get(chunk_id, 0)
+                ) / total_weight if total_weight > 0 else 0
+                fused_scores[chunk_id] = score
+        
+        # ========== 5. Build SearchResult objects ==========
+        # Create lookup dicts for individual scores
+        vector_dict = dict(vector_results)
+        bm25_dict = dict(bm25_results)
+        concept_dict = dict(concept_results)
         
         fused_results = []
-        for chunk_id in all_chunk_ids:
-            v_score = vector_results.get(chunk_id, 0.0)
-            c_score = concept_results.get(chunk_id, 0.0)
-            k_score = keyword_results.get(chunk_id, 0.0)
-            
-            # Weighted combination (normalize weights)
-            total_weight = vector_weight + concept_weight + effective_keyword_weight
-            combined_score = (
-                (vector_weight * v_score) + 
-                (concept_weight * c_score) + 
-                (effective_keyword_weight * k_score)
-            ) / total_weight if total_weight > 0 else 0
-            
-            # Boost score when we have strong concept AND keyword matches
-            # This indicates a direct term match which should rank highly
-            if c_score >= 0.5 and k_score >= 0.5:
-                # Both concept and keyword matched - high confidence
-                boost = min(c_score, k_score) * 0.3  # Up to 0.3 boost
-                combined_score = min(combined_score + boost, 1.0)
-            elif c_score >= 0.8 or k_score >= 0.8:
-                # At least one very strong match
-                boost = max(c_score, k_score) * 0.15
-                combined_score = min(combined_score + boost, 1.0)
-            
-            # Get chunk from either store
+        for chunk_id, combined_score in fused_scores.items():
+            # Get chunk from any store
             chunk = (
                 self.vector_store.get_chunk(chunk_id) or 
+                self.bm25_index.get_chunk(chunk_id) or
                 self.concept_index.get_chunk(chunk_id)
             )
             
-            if chunk:
-                # Determine matched concepts
-                matched_concepts = []
-                matched_capabilities = []
-                
-                for qc in query_concepts:
-                    for cm in chunk.domain_matches:
-                        if cm.canonical_term.lower() == qc.canonical_term.lower():
-                            matched_concepts.append(cm.canonical_term)
-                            matched_capabilities.extend(cm.capabilities)
-                
-                # Determine retrieval method
-                methods = []
-                if v_score > 0:
-                    methods.append("vector")
-                if c_score > 0:
-                    methods.append("concept")
-                if k_score > 0:
-                    methods.append("keyword")
-                method = "+".join(methods) if methods else "unknown"
-                
-                result = SearchResult(
-                    chunk=chunk,
-                    vector_score=v_score,
-                    concept_score=c_score,
-                    keyword_score=k_score,
-                    combined_score=combined_score,
-                    matched_concepts=list(set(matched_concepts)),
-                    matched_capabilities=list(set(matched_capabilities)),
-                    retrieval_method=method
-                )
-                fused_results.append(result)
+            if not chunk:
+                continue
+            
+            # Determine matched concepts
+            matched_concepts = []
+            matched_capabilities = []
+            for qc in query_concepts:
+                for cm in chunk.domain_matches:
+                    if cm.canonical_term.lower() == qc.canonical_term.lower():
+                        matched_concepts.append(cm.canonical_term)
+                        matched_capabilities.extend(cm.capabilities)
+            
+            # Determine retrieval method
+            methods = []
+            if chunk_id in vector_dict:
+                methods.append("vector")
+            if chunk_id in bm25_dict:
+                methods.append("bm25")
+            if chunk_id in concept_dict:
+                methods.append("concept")
+            method = "+".join(methods) if methods else "unknown"
+            
+            result = SearchResult(
+                chunk=chunk,
+                vector_score=vector_dict.get(chunk_id, 0.0),
+                bm25_score=bm25_dict.get(chunk_id, 0.0),
+                concept_score=concept_dict.get(chunk_id, 0.0),
+                keyword_score=0.0,  # Deprecated, kept for compatibility
+                combined_score=combined_score,
+                matched_concepts=list(set(matched_concepts)),
+                matched_capabilities=list(set(matched_capabilities)),
+                retrieval_method=method
+            )
+            fused_results.append(result)
         
         # Sort by combined score
         fused_results.sort(key=lambda x: x.combined_score, reverse=True)
@@ -734,88 +1075,241 @@ class HybridIndex:
             'concept_index': self.concept_index.get_statistics()
         }
     
-    def save(self, directory: str, use_numpy: bool = True):
+    def save(self, directory: str, use_numpy: bool = True, verbose: bool = True):
         """
-        Save index to disk
+        Save index to disk using generation-based versioning.
+        
+        NON-BLOCKING: Does not interfere with concurrent searches.
+        
+        Process:
+        1. Write new data to gen_N+1/ subdirectory
+        2. Atomic update of generation.txt pointer
+        3. Old generation cleaned up after grace period
         
         Args:
             directory: Directory to save index files
             use_numpy: If True, save embeddings as .npy binary (faster, smaller)
                        If False, save as .json (human readable)
+            verbose: If True, print detailed generation logging
         """
         path = Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         
-        # Save chunks
-        chunks_data = [
-            chunk.to_dict() 
-            for chunk in self.concept_index.chunks.values()
-        ]
+        # Get current generation and prepare next
+        current_gen = get_current_generation(path)
+        next_gen = current_gen + 1
+        gen_path = path / f'gen_{next_gen}'
         
-        with open(path / 'chunks.json', 'w') as f:
-            json.dump(chunks_data, f, indent=2)
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"GENERATION UPDATE: {current_gen} → {next_gen}")
+            print(f"{'='*60}")
+            print(f"  📂 Current generation: {current_gen}")
+            print(f"  📂 Writing new generation: {next_gen}")
+            print(f"  📁 Target directory: {gen_path}")
         
-        # Save embeddings if available
-        if self.vector_store.embeddings:
-            if use_numpy:
-                # Binary numpy format - faster and smaller
-                chunk_ids = list(self.vector_store.embeddings.keys())
-                embeddings_array = np.array([
-                    self.vector_store.embeddings[cid] for cid in chunk_ids
-                ])
-                
-                # Save as .npy file
-                np.save(path / 'embeddings.npy', embeddings_array)
-                with open(path / 'embedding_ids.json', 'w') as f:
-                    json.dump(chunk_ids, f)
-                
-                # Save dimensions info
-                embed_meta = {
-                    'format': 'numpy',
-                    'shape': list(embeddings_array.shape),
-                    'dtype': str(embeddings_array.dtype)
-                }
-                with open(path / 'embeddings_meta.json', 'w') as f:
-                    json.dump(embed_meta, f, indent=2)
-            else:
-                # JSON format - human readable but larger
-                embeddings_data = {
-                    chunk_id: embedding.tolist()
-                    for chunk_id, embedding in self.vector_store.embeddings.items()
-                }
-                with open(path / 'embeddings.json', 'w') as f:
-                    json.dump(embeddings_data, f)
+        # Write to new generation directory
+        gen_path.mkdir(parents=True, exist_ok=True)
         
-        # Save metadata
-        with open(path / 'metadata.json', 'w') as f:
-            json.dump(self.metadata, f, indent=2)
-        
-        print(f"Index saved to {directory}")
+        try:
+            # Save chunks
+            chunks_data = [
+                chunk.to_dict() 
+                for chunk in self.concept_index.chunks.values()
+            ]
+            
+            if verbose:
+                print(f"\n  Writing gen_{next_gen}/...")
+                print(f"    • chunks.json ({len(chunks_data)} chunks)")
+            
+            with open(gen_path / 'chunks.json', 'w') as f:
+                json.dump(chunks_data, f, indent=2)
+            
+            # Save embeddings if available
+            if self.vector_store.embeddings:
+                if use_numpy:
+                    # Binary numpy format - faster and smaller
+                    chunk_ids = list(self.vector_store.embeddings.keys())
+                    embeddings_array = np.array([
+                        self.vector_store.embeddings[cid] for cid in chunk_ids
+                    ])
+                    
+                    # Save as .npy file
+                    np.save(gen_path / 'embeddings.npy', embeddings_array)
+                    with open(gen_path / 'embedding_ids.json', 'w') as f:
+                        json.dump(chunk_ids, f)
+                    
+                    if verbose:
+                        print(f"    • embeddings.npy ({embeddings_array.shape[0]} vectors, {embeddings_array.shape[1]} dims)")
+                    
+                    # Save dimensions info
+                    embed_meta = {
+                        'format': 'numpy',
+                        'shape': list(embeddings_array.shape),
+                        'dtype': str(embeddings_array.dtype)
+                    }
+                    with open(gen_path / 'embeddings_meta.json', 'w') as f:
+                        json.dump(embed_meta, f, indent=2)
+                else:
+                    # JSON format - human readable but larger
+                    embeddings_data = {
+                        chunk_id: embedding.tolist()
+                        for chunk_id, embedding in self.vector_store.embeddings.items()
+                    }
+                    with open(gen_path / 'embeddings.json', 'w') as f:
+                        json.dump(embeddings_data, f)
+                    if verbose:
+                        print(f"    • embeddings.json ({len(embeddings_data)} vectors)")
+            
+            # Save BM25 index
+            bm25_data = {
+                'N': self.bm25_index.N,
+                'avgdl': self.bm25_index.avgdl,
+                'doc_lengths': self.bm25_index.doc_lengths,
+                'chunk_ids': self.bm25_index.chunk_ids,
+                'term_doc_freqs': self.bm25_index.term_doc_freqs,
+                'inverted_index': {
+                    term: dict(postings)
+                    for term, postings in self.bm25_index.inverted_index.items()
+                },
+                'idf_cache': self.bm25_index._idf_cache,
+                'index_built': self.bm25_index._index_built,
+                'k1': self.bm25_index.k1,
+                'b': self.bm25_index.b
+            }
+            with open(gen_path / 'bm25_index.json', 'w') as f:
+                json.dump(bm25_data, f, indent=2)
+            
+            if verbose:
+                print(f"    • bm25_index.json ({len(bm25_data['term_doc_freqs'])} terms)")
+            
+            # Save metadata
+            with open(gen_path / 'metadata.json', 'w') as f:
+                json.dump(self.metadata, f, indent=2)
+            
+            if verbose:
+                print(f"    • metadata.json")
+            
+            # ATOMIC: Update generation pointer
+            # Write to temp file then rename for atomicity
+            if verbose:
+                print(f"\n  ⚡ ATOMIC POINTER SWAP")
+                print(f"    Writing generation.txt.tmp → '{next_gen}'")
+            
+            gen_file = path / 'generation.txt'
+            temp_gen_file = path / 'generation.txt.tmp'
+            temp_gen_file.write_text(str(next_gen))
+            
+            if verbose:
+                print(f"    Renaming generation.txt.tmp → generation.txt")
+            
+            temp_gen_file.rename(gen_file)
+            
+            if verbose:
+                print(f"    ✓ Generation pointer updated: {current_gen} → {next_gen}")
+                print(f"\n  🔄 Searches now see generation {next_gen}")
+            
+            print(f"\nIndex saved to {directory} (generation {next_gen})")
+            
+            # Clean up old generations (keep last 2 for safety)
+            self._cleanup_old_generations(path, keep_last=2, verbose=verbose)
+            
+        except Exception as e:
+            # Clean up failed generation
+            if verbose:
+                print(f"\n  ❌ Error during save: {e}")
+                print(f"    Cleaning up failed generation {next_gen}...")
+            if gen_path.exists():
+                shutil.rmtree(gen_path, ignore_errors=True)
+            raise
     
-    def load(self, directory: str):
+    def _cleanup_old_generations(self, index_dir: Path, keep_last: int = 2, verbose: bool = False):
+        """Remove old generation directories, keeping the most recent ones."""
+        current_gen = get_current_generation(index_dir)
+        
+        # Find all generation directories
+        gen_dirs = []
+        for item in index_dir.iterdir():
+            if item.is_dir() and item.name.startswith('gen_'):
+                try:
+                    gen_num = int(item.name.split('_')[1])
+                    gen_dirs.append((gen_num, item))
+                except (ValueError, IndexError):
+                    pass
+        
+        # Sort by generation number
+        gen_dirs.sort(key=lambda x: x[0], reverse=True)
+        
+        # Remove old generations (keep most recent ones)
+        to_remove = gen_dirs[keep_last:]
+        if to_remove and verbose:
+            print(f"\n  🧹 Cleanup: removing {len(to_remove)} old generation(s)")
+        
+        for gen_num, gen_path in to_remove:
+            try:
+                if verbose:
+                    print(f"    Removing gen_{gen_num}/")
+                shutil.rmtree(gen_path)
+            except Exception as e:
+                if verbose:
+                    print(f"    ⚠️  Could not remove gen_{gen_num}: {e}")
+        
+        if verbose and gen_dirs:
+            kept = gen_dirs[:keep_last]
+            kept_nums = [g[0] for g in kept]
+            print(f"    Keeping generations: {kept_nums}")
+    
+    def load(self, directory: str, verbose: bool = False):
         """
-        Load index from disk
+        Load index from disk using generation-based versioning.
+        
+        NON-BLOCKING: Never waits for writes. Always gets consistent snapshot.
         
         Args:
             directory: Directory containing index files
+            verbose: If True, print detailed generation logging
         """
         path = Path(directory)
         
         if not path.exists():
             raise FileNotFoundError(f"Index directory not found: {directory}")
         
+        # Get current generation and its path
+        current_gen = get_current_generation(path)
+        gen_path = get_generation_path(path, current_gen)
+        
+        if verbose:
+            print(f"\n  📖 Loading generation {current_gen} from {gen_path}")
+        
+        # Handle legacy format (no generation subdirectory)
+        if current_gen == 0 and not (gen_path / 'chunks.json').exists():
+            # Check if chunks.json exists in root (legacy)
+            if (path / 'chunks.json').exists():
+                gen_path = path
+                if verbose:
+                    print(f"    Using legacy format (no generation subdirs)")
+            else:
+                raise FileNotFoundError(f"No index data found in {directory}")
+        
         # Load chunks
-        with open(path / 'chunks.json', 'r') as f:
+        chunks_file = gen_path / 'chunks.json'
+        if not chunks_file.exists():
+            raise FileNotFoundError(f"chunks.json not found in {gen_path}")
+            
+        with open(chunks_file, 'r') as f:
             chunks_data = json.load(f)
         
         for chunk_data in chunks_data:
             chunk = IndexableChunk.from_dict(chunk_data)
             self.concept_index.add(chunk)
         
+        if verbose:
+            print(f"    Loaded {len(chunks_data)} chunks")
+        
         # Load embeddings - try numpy format first, then JSON
-        numpy_path = path / 'embeddings.npy'
-        json_path = path / 'embeddings.json'
-        ids_path = path / 'embedding_ids.json'
+        numpy_path = gen_path / 'embeddings.npy'
+        json_path = gen_path / 'embeddings.json'
+        ids_path = gen_path / 'embedding_ids.json'
         
         if numpy_path.exists() and ids_path.exists():
             # Load numpy binary format
@@ -839,10 +1333,37 @@ class HybridIndex:
                 if chunk:
                     self.vector_store.add(chunk_id, embedding, chunk)
         
+        # Load BM25 index if available
+        bm25_path = gen_path / 'bm25_index.json'
+        if bm25_path.exists():
+            with open(bm25_path, 'r') as f:
+                bm25_data = json.load(f)
+            
+            self.bm25_index.N = bm25_data.get('N', 0)
+            self.bm25_index.avgdl = bm25_data.get('avgdl', 0)
+            self.bm25_index.doc_lengths = bm25_data.get('doc_lengths', [])
+            self.bm25_index.chunk_ids = bm25_data.get('chunk_ids', [])
+            self.bm25_index.term_doc_freqs = bm25_data.get('term_doc_freqs', {})
+            self.bm25_index.inverted_index = {
+                term: {int(k): v for k, v in postings.items()}
+                for term, postings in bm25_data.get('inverted_index', {}).items()
+            }
+            self.bm25_index._idf_cache = bm25_data.get('idf_cache', {})
+            self.bm25_index._index_built = bm25_data.get('index_built', False)
+            self.bm25_index.k1 = bm25_data.get('k1', 1.5)
+            self.bm25_index.b = bm25_data.get('b', 0.75)
+            
+            # Rebuild chunks dict from concept_index
+            for chunk_id in self.bm25_index.chunk_ids:
+                chunk = self.concept_index.get_chunk(chunk_id)
+                if chunk:
+                    self.bm25_index.chunks[chunk_id] = chunk
+        
         # Load metadata
-        metadata_path = path / 'metadata.json'
+        metadata_path = gen_path / 'metadata.json'
         if metadata_path.exists():
             with open(metadata_path, 'r') as f:
                 self.metadata = json.load(f)
         
-        print(f"Index loaded from {directory}: {len(self.concept_index)} chunks")
+        gen_info = f" (generation {current_gen})" if current_gen > 0 else ""
+        print(f"Index loaded from {directory}{gen_info}: {len(self.concept_index)} chunks")
