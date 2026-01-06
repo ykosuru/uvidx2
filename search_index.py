@@ -264,7 +264,7 @@ ARGUMENTS
     --analyze         Send results to LLM for analysis
     --provider        LLM provider (default: tachyon)
     --model           LLM model name
-    --min-score       Minimum score for LLM analysis (default: 0.50)
+    --min-score       Minimum score for LLM analysis (default: 0.10)
 
 ================================================================================
 INTERACTIVE COMMANDS
@@ -1395,12 +1395,27 @@ def search_decomposed(pipeline: IndexingPipeline,
     
     fused_scores = reciprocal_rank_fusion(all_results, k=60)
     
+    # Normalize RRF scores to 0-1 range
+    # Raw RRF scores are tiny (e.g., 0.01-0.05), need normalization for thresholds
+    if fused_scores:
+        max_rrf = max(fused_scores.values())
+        min_rrf = min(fused_scores.values())
+        rrf_range = max_rrf - min_rrf
+        if rrf_range > 0:
+            fused_scores = {
+                cid: (score - min_rrf) / rrf_range 
+                for cid, score in fused_scores.items()
+            }
+        else:
+            # Single result or all same score - give full score
+            fused_scores = {cid: 1.0 for cid in fused_scores}
+    
     # Build final result list
     final_results = []
     for chunk_id, rrf_score in sorted(fused_scores.items(), key=lambda x: -x[1]):
         if chunk_id in chunk_lookup:
             result = chunk_lookup[chunk_id]
-            # Update combined_score to RRF score for display
+            # Update combined_score to normalized RRF score
             result.combined_score = rrf_score
             final_results.append(result)
     
@@ -1438,7 +1453,7 @@ def search_and_analyze(pipeline: IndexingPipeline,
                        provider: 'LLMProvider',
                        top_k: int = 20,
                        source_type: str = "all",
-                       min_score: float = 0.50,
+                       min_score: float = 0.10,
                        verbose: bool = False,
                        knowledge_graph: Optional[KnowledgeGraph] = None,
                        expand_query: bool = False,
@@ -1531,7 +1546,7 @@ def search_and_analyze_decomposed(pipeline: IndexingPipeline,
                                    provider: 'LLMProvider',
                                    top_k: int = 20,
                                    source_type: str = "all",
-                                   min_score: float = 0.50,
+                                   min_score: float = 0.10,
                                    verbose: bool = False,
                                    knowledge_graph: Optional[KnowledgeGraph] = None,
                                    expand_query: bool = False,
@@ -1754,7 +1769,7 @@ def list_capabilities(pipeline: IndexingPipeline):
 
 def interactive_mode(pipeline: IndexingPipeline, 
                      provider: 'LLMProvider' = None,
-                     min_score: float = 0.50,
+                     min_score: float = 0.10,
                      verbose: bool = False,
                      knowledge_graph: Optional[KnowledgeGraph] = None,
                      vocabulary: list = None,
@@ -2107,13 +2122,14 @@ Interactive commands for knowledge graph:
                         help="LLM provider (default: tachyon)")
     parser.add_argument("--model", "-m", type=str, default=None,
                         help="LLM model name (provider-specific)")
-    parser.add_argument("--min-score", type=float, default=0.50,
-                        help="Minimum score for LLM analysis (default: 0.50)")
+    parser.add_argument("--min-score", type=float, default=0.10,
+                        help="Minimum score for LLM analysis (default: 0.10)")
     
     # Knowledge graph options
     parser.add_argument("--knowledge-graph", "-kg", type=str, default=None,
                         help="Path to knowledge_graph.json for query expansion and TF-IDF boosting")
     parser.add_argument("--expand-query", "-e", action="store_true",
+                        help="Expand query using related terms from knowledge graph")
     parser.add_argument("--tfidf-boost", "-b", action="store_true",
                         help="Boost scores based on TF-IDF (distinctive terms)")
     parser.add_argument("--decompose", "-d", action="store_true",
