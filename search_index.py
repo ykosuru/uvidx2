@@ -77,7 +77,7 @@ ARCHITECTURE
 │  │                                                                     │    │
 │  │  📝 Content:                                                        │    │
 │  │     PROC SCREEN_OFAC(customer_name, result);                        │    │
-│  │     ...                                                             │    │
+│  │     ...                                                              │   │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -137,38 +137,38 @@ The KnowledgeGraph class provides fast lookups for search enhancement:
 │                                                                             │
 │  class KnowledgeGraph:                                                      │
 │                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ Data Structures                                                     │    │
-│  │                                                                     │    │
-│  │  nodes: Dict[str, Dict]                                             │    │
-│  │    └─ "ofac" → {id, label, type, tf_idf_score, co_occurs_with}      │    │
-│  │                                                                     │    │
-│  │  _outgoing_edges: Dict[str, List[Dict]]                             │    │
-│  │    └─ "ofac" → [{source: ofac, target: sanctions, type: co_occurs}] │    │
-│  │                                                                     │    │
-│  │  _incoming_edges: Dict[str, List[Dict]]                             │    │
-│  │    └─ "sanctions" → [{source: ofac, target: sanctions, ...}]        │    │
-│  │                                                                     │    │
-│  │  _label_to_id: Dict[str, str]                                       │    │
-│  │    └─ "OFAC" → "ofac" (case-insensitive lookup)                     │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Data Structures                                                      │   │
+│  │                                                                      │   │
+│  │  nodes: Dict[str, Dict]                                             │   │
+│  │    └─ "ofac" → {id, label, type, tf_idf_score, co_occurs_with}     │   │
+│  │                                                                      │   │
+│  │  _outgoing_edges: Dict[str, List[Dict]]                             │   │
+│  │    └─ "ofac" → [{source: ofac, target: sanctions, type: co_occurs}] │   │
+│  │                                                                      │   │
+│  │  _incoming_edges: Dict[str, List[Dict]]                             │   │
+│  │    └─ "sanctions" → [{source: ofac, target: sanctions, ...}]        │   │
+│  │                                                                      │   │
+│  │  _label_to_id: Dict[str, str]                                       │   │
+│  │    └─ "OFAC" → "ofac" (case-insensitive lookup)                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │ Key Methods                                                         │    │
-│  │                                                                     │    │
-│  │  get_node(term) → Dict                                              │    │
-│  │    Returns node data for a term (by ID or label)                    │    │
-│  │                                                                     │    │
-│  │  get_related_terms(term, max_terms=10) → List[(term, type, weight)] │    │
-│  │    BFS traversal to find related terms via edges                    │    │
-│  │                                                                     │    │
-│  │  get_tfidf_score(term) → float                                      │    │
-│  │    Returns TF-IDF score for boosting (0.0 if not found)             │    │
-│  │                                                                     │    │
-│  │  expand_query(query) → str                                          │    │
-│  │    Expands query by adding related terms                            │    │
-│  │    "OFAC" → "ofac sanctions sdn screening"                          │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Key Methods                                                          │   │
+│  │                                                                      │   │
+│  │  get_node(term) → Dict                                              │   │
+│  │    Returns node data for a term (by ID or label)                    │   │
+│  │                                                                      │   │
+│  │  get_related_terms(term, max_terms=10) → List[(term, type, weight)] │   │
+│  │    BFS traversal to find related terms via edges                    │   │
+│  │                                                                      │   │
+│  │  get_tfidf_score(term) → float                                      │   │
+│  │    Returns TF-IDF score for boosting (0.0 if not found)             │   │
+│  │                                                                      │   │
+│  │  expand_query(query) → str                                          │   │
+│  │    Expands query by adding related terms                            │   │
+│  │    "OFAC" → "ofac sanctions sdn screening"                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 
@@ -951,7 +951,7 @@ def search_once(pipeline: IndexingPipeline,
     # === Step 3: Execute the search ===
     # If TF-IDF boosting is enabled, fetch extra results for re-ranking
     # This ensures we have enough candidates after re-ranking
-    fetch_k = top_k * 2 if tfidf_boost and knowledge_graph else top_k
+    fetch_k = top_k * 3 if tfidf_boost and knowledge_graph else top_k * 2  # Fetch more for dedup
     
     # pipeline.search() does the heavy lifting:
     # - Embeds the query
@@ -968,9 +968,19 @@ def search_once(pipeline: IndexingPipeline,
     # This step boosts results that match distinctive terms
     if knowledge_graph and tfidf_boost and results:
         results = apply_tfidf_boost(results, knowledge_graph, query)
-        results = results[:top_k]  # Trim to requested count after re-ranking
     
-    # === Step 5: Display results ===
+    # === Step 5: Deduplicate by file ===
+    # Keep only the highest-scoring chunk per file
+    seen_files = set()
+    deduped_results = []
+    for r in results:
+        file_path = r.chunk.source_ref.file_path or r.chunk.chunk_id
+        if file_path not in seen_files:
+            seen_files.add(file_path)
+            deduped_results.append(r)
+    results = deduped_results[:top_k]
+    
+    # === Step 6: Display results ===
     print(f"\n{'═' * 60}")
     print(f"Found {len(results)} result(s)")
     if knowledge_graph and (expand_query or tfidf_boost):
@@ -1394,7 +1404,17 @@ def search_decomposed(pipeline: IndexingPipeline,
             result.combined_score = rrf_score
             final_results.append(result)
     
-    final_results = final_results[:top_k]
+    # Deduplicate by file - keep only best chunk per file
+    seen_files = {}
+    deduped_results = []
+    for result in final_results:
+        file_path = result.chunk.source_ref.file_path or result.chunk.chunk_id
+        if file_path not in seen_files:
+            seen_files[file_path] = result
+            deduped_results.append(result)
+        # else: skip duplicate file, keep higher-scored one (results already sorted)
+    
+    final_results = deduped_results[:top_k]
     
     # Assign ranks
     for i, result in enumerate(final_results):
@@ -1422,12 +1442,16 @@ def search_and_analyze(pipeline: IndexingPipeline,
                        verbose: bool = False,
                        knowledge_graph: Optional[KnowledgeGraph] = None,
                        expand_query: bool = False,
-                       tfidf_boost: bool = False):
+                       tfidf_boost: bool = False,
+                       full_file: bool = False):
     """
     Search and analyze with LLM, with optional knowledge graph enhancement.
     
     The LLM receives relevant code/documentation for analysis.
     Knowledge graph can expand the query and boost distinctive terms.
+    
+    Args:
+        full_file: If True, send full file content to LLM instead of just chunks
     """
     
     source_types = None
@@ -1483,6 +1507,8 @@ def search_and_analyze(pipeline: IndexingPipeline,
     
     # Send to LLM for analysis
     print(f"\n🤖 Sending to LLM for analysis...")
+    if full_file:
+        print(f"   📁 Full file mode: enabled")
     
     response = analyze_search_results(
         query=query,
@@ -1490,7 +1516,8 @@ def search_and_analyze(pipeline: IndexingPipeline,
         provider=provider,
         min_score=min_score,
         max_chunks=20,
-        verbose=verbose
+        verbose=verbose,
+        full_file=full_file
     )
     
     print_llm_analysis(response, verbose)
@@ -1508,7 +1535,8 @@ def search_and_analyze_decomposed(pipeline: IndexingPipeline,
                                    verbose: bool = False,
                                    knowledge_graph: Optional[KnowledgeGraph] = None,
                                    expand_query: bool = False,
-                                   tfidf_boost: bool = False):
+                                   tfidf_boost: bool = False,
+                                   full_file: bool = False):
     """
     Search with query decomposition and analyze with LLM.
     
@@ -1550,7 +1578,7 @@ def search_and_analyze_decomposed(pipeline: IndexingPipeline,
     if len(sub_queries) == 1:
         return search_and_analyze(pipeline, query, provider, top_k, source_type,
                                   min_score, verbose, knowledge_graph, 
-                                  expand_query, tfidf_boost)
+                                  expand_query, tfidf_boost, full_file)
     
     print(f"\n🔎 Query decomposition for LLM analysis:")
     print(f"   Original: \"{query}\"")
@@ -1562,6 +1590,7 @@ def search_and_analyze_decomposed(pipeline: IndexingPipeline,
     # Search each sub-query and collect results
     results_by_subquery = {}  # sub_query -> list of results
     all_chunks_seen = set()   # Track unique chunks
+    all_files_seen = set()    # Track unique files
     
     for sq in sub_queries:
         # Expand if enabled
@@ -1576,14 +1605,17 @@ def search_and_analyze_decomposed(pipeline: IndexingPipeline,
         if knowledge_graph and tfidf_boost and results:
             results = apply_tfidf_boost(results, knowledge_graph, sq)
         
-        # Filter by score and dedupe
+        # Filter by score and dedupe by chunk and file
         filtered = []
         for r in results:
             if r.combined_score >= min_score:
                 chunk_id = r.chunk.chunk_id
-                if chunk_id not in all_chunks_seen:
+                file_path = r.chunk.source_ref.file_path or chunk_id
+                # Dedupe by both chunk_id and file_path
+                if chunk_id not in all_chunks_seen and file_path not in all_files_seen:
                     filtered.append(r)
                     all_chunks_seen.add(chunk_id)
+                    all_files_seen.add(file_path)
         
         results_by_subquery[sq] = filtered
         
@@ -1605,10 +1637,15 @@ def search_and_analyze_decomposed(pipeline: IndexingPipeline,
     
     # Build LLM prompt with results organized by sub-query
     print(f"\n🤖 Sending to LLM for analysis...")
+    if full_file:
+        print(f"   📁 Full file mode: enabled")
     
     context_parts = []
     context_parts.append(f"Original Question: {query}\n")
     context_parts.append(f"The query was decomposed into {len(sub_queries)} search perspectives:\n")
+    
+    # Track files already included (for full_file deduplication)
+    files_included_in_context = set()
     
     for i, (sq, results) in enumerate(results_by_subquery.items(), 1):
         if i == 1:
@@ -1626,13 +1663,32 @@ def search_and_analyze_decomposed(pipeline: IndexingPipeline,
             proc = chunk.metadata.get('procedure_name') or chunk.metadata.get('function_name')
             source = chunk.source_ref.file_path or 'unknown'
             
+            # Skip if we already included this file in full_file mode
+            if full_file and source in files_included_in_context:
+                continue
+            
             context_parts.append(f"\n--- Result {i}.{j} [{r.combined_score:.3f}] ---")
             context_parts.append(f"Source: {source}")
             if proc:
                 context_parts.append(f"Procedure: {proc}")
-            context_parts.append(f"Content:\n{chunk.text[:1500]}")
-            if len(chunk.text) > 1500:
-                context_parts.append("... (truncated)")
+            
+            # Use full file content if enabled
+            if full_file and source != 'unknown':
+                try:
+                    with open(source, 'r', encoding='utf-8', errors='ignore') as f:
+                        file_content = f.read(50000)  # Max 50KB
+                        if len(file_content) == 50000:
+                            file_content += "\n... (truncated at 50KB)"
+                    context_parts.append(f"Full File Content:\n{file_content}")
+                    files_included_in_context.add(source)
+                except:
+                    context_parts.append(f"Content:\n{chunk.text[:1500]}")
+                    if len(chunk.text) > 1500:
+                        context_parts.append("... (truncated)")
+            else:
+                context_parts.append(f"Content:\n{chunk.text[:1500]}")
+                if len(chunk.text) > 1500:
+                    context_parts.append("... (truncated)")
     
     context = "\n".join(context_parts)
     
@@ -1701,7 +1757,8 @@ def interactive_mode(pipeline: IndexingPipeline,
                      min_score: float = 0.50,
                      verbose: bool = False,
                      knowledge_graph: Optional[KnowledgeGraph] = None,
-                     vocabulary: list = None):
+                     vocabulary: list = None,
+                     full_file: bool = False):
     """
     Run interactive search mode with optional knowledge graph support.
     
@@ -1712,6 +1769,7 @@ def interactive_mode(pipeline: IndexingPipeline,
         verbose: Verbose output mode
         knowledge_graph: Optional knowledge graph for query expansion/boosting
         vocabulary: Vocabulary list for query decomposition
+        full_file: Send full file content to LLM instead of chunks
     """
     print("\n" + "=" * 60)
     print("INTERACTIVE SEARCH MODE")
@@ -1743,6 +1801,7 @@ Knowledge Graph ({kg_status}):
   :boost            Toggle TF-IDF boosting (current: {'ON' if tfidf_boost else 'OFF'})
   :related          Toggle related terms display (current: {'ON' if show_related else 'OFF'})
   :decompose        Toggle query decomposition for long queries (current: {'ON' if decompose_queries else 'OFF'})
+  :fullfile         Toggle full file mode for LLM (current: {'ON' if full_file else 'OFF'})
   :lookup <term>    Look up term in knowledge graph
   :graph            Show knowledge graph stats
   
@@ -1834,6 +1893,14 @@ Commands:
             else:
                 print("❌ Requires knowledge graph and vocabulary. Use --knowledge-graph option.")
         
+        elif query.lower() == ":fullfile":
+            full_file = not full_file
+            print(f"Full file mode: {'ON' if full_file else 'OFF'}")
+            if full_file:
+                print("   LLM will receive full file content (up to 50KB per file)")
+            else:
+                print("   LLM will receive only relevant chunks")
+        
         elif query.lower().startswith(":lookup "):
             term = query[8:].strip()
             if knowledge_graph:
@@ -1911,13 +1978,15 @@ Commands:
                                                   verbose=verbose,
                                                   knowledge_graph=knowledge_graph,
                                                   expand_query=expand_query,
-                                                  tfidf_boost=tfidf_boost)
+                                                  tfidf_boost=tfidf_boost,
+                                                  full_file=full_file)
                 else:
                     search_and_analyze(pipeline, q, provider, top_k=20, 
                                        min_score=min_score, verbose=verbose,
                                        knowledge_graph=knowledge_graph,
                                        expand_query=expand_query,
-                                       tfidf_boost=tfidf_boost)
+                                       tfidf_boost=tfidf_boost,
+                                       full_file=full_file)
         
         elif query.lower().startswith(":cap "):
             capability = query[5:].strip()
@@ -2054,6 +2123,8 @@ Interactive commands for knowledge graph:
                         help="Don't show related terms in results")
     parser.add_argument("--no-kg", action="store_true",
                         help="Don't auto-load embedded knowledge graph from index")
+    parser.add_argument("--full-file", "-f", action="store_true",
+                        help="Send full file content to LLM (instead of just chunks)")
     
     args = parser.parse_args()
     
@@ -2137,7 +2208,7 @@ Interactive commands for knowledge graph:
     # Run search
     if args.interactive:
         interactive_mode(pipeline, llm_provider, args.min_score, args.verbose, 
-                        knowledge_graph, vocabulary=vocab_data)
+                        knowledge_graph, vocabulary=vocab_data, full_file=args.full_file)
     elif args.analyze and args.query:
         if llm_provider:
             if args.decompose and knowledge_graph:
@@ -2150,7 +2221,8 @@ Interactive commands for knowledge graph:
                     verbose=args.verbose,
                     knowledge_graph=knowledge_graph,
                     expand_query=args.expand_query,
-                    tfidf_boost=args.tfidf_boost
+                    tfidf_boost=args.tfidf_boost,
+                    full_file=args.full_file
                 )
             else:
                 search_and_analyze(
@@ -2161,7 +2233,8 @@ Interactive commands for knowledge graph:
                     verbose=args.verbose,
                     knowledge_graph=knowledge_graph,
                     expand_query=args.expand_query,
-                    tfidf_boost=args.tfidf_boost
+                    tfidf_boost=args.tfidf_boost,
+                    full_file=args.full_file
                 )
         else:
             print("❌ LLM analysis requires a valid provider. Check API keys.")
