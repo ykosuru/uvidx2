@@ -201,7 +201,9 @@ from typing import Dict, List, Optional
 # Add current directory to path for local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from unified_indexer import IndexingPipeline, SourceType
+# Direct imports to avoid circular import issues
+from unified_indexer.pipeline import IndexingPipeline
+from unified_indexer.models import SourceType
 
 # Default vocabulary file - located in same directory as this script
 DEFAULT_KEYWORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keywords.json")
