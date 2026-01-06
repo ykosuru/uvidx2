@@ -28,6 +28,7 @@ class SemanticType(Enum):
     VARIABLE_DECL = "variable_declaration"
     STRUCT_DEF = "structure_definition"
     COMMENT = "comment"
+    TEXT_BLOCK = "text_block"  # Generic code block
     
     # Document types
     SECTION = "section"
@@ -280,15 +281,16 @@ class SearchResult:
     """
     A single search result from the hybrid index
     
-    Combines vector similarity with concept matching scores.
+    Combines vector similarity, BM25 lexical, and concept matching scores.
     """
     chunk: IndexableChunk
     
     # Scoring
     vector_score: float = 0.0           # Cosine similarity from vector search
+    bm25_score: float = 0.0             # BM25 lexical search score
     concept_score: float = 0.0          # Score from concept/keyword matching
     keyword_score: float = 0.0          # Score from raw text/grep matching
-    combined_score: float = 0.0         # Fused score
+    combined_score: float = 0.0         # Fused score (RRF or weighted)
     
     # Match details
     matched_concepts: List[str] = field(default_factory=list)
@@ -296,7 +298,7 @@ class SearchResult:
     
     # Ranking metadata
     rank: int = 0
-    retrieval_method: str = "hybrid"    # "vector", "concept", "keyword", or combinations
+    retrieval_method: str = "hybrid"    # "vector", "bm25", "concept", or combinations
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for display/serialization"""
@@ -306,6 +308,7 @@ class SearchResult:
             'source_type': self.chunk.source_type.value,
             'source_ref': str(self.chunk.source_ref),
             'vector_score': round(self.vector_score, 4),
+            'bm25_score': round(self.bm25_score, 4),
             'concept_score': round(self.concept_score, 4),
             'keyword_score': round(self.keyword_score, 4),
             'combined_score': round(self.combined_score, 4),
