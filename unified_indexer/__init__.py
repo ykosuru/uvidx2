@@ -39,7 +39,7 @@ from .parsers.base import ContentParser
 from .parsers.tal_parser import TalCodeParser
 from .parsers.document_parser import DocumentParser
 from .parsers.log_parser import LogParser
-from .index import HybridIndex
+from .index import HybridIndex, BM25Index, reciprocal_rank_fusion
 
 from .embeddings import (
     create_embedder,
@@ -77,6 +77,8 @@ __all__ = [
     "LogParser",
     # Index
     "HybridIndex",
+    "BM25Index",
+    "reciprocal_rank_fusion",
     # Local Embeddings
     "create_embedder",
     "HybridEmbedder",
@@ -92,5 +94,5 @@ __all__ = [
     # LLM Integration
     "LLMInterface",
     "LLMEnhancedPipeline",
-    "ExampleLLMImplementation"
+    "ExampleLLMImplementation",
 ]
