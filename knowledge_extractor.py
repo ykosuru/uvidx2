@@ -449,6 +449,91 @@ class KnowledgeExtractor:
         self.total_documents: int = 0                    # Document count
         self.document_term_sets: List[Set[str]] = []     # Terms per doc for co-occurrence
     
+    def load_existing_state(self, graph_path: str, stats_path: Optional[str] = None):
+        """
+        Load existing extraction state from graph and stats files.
+        
+        This allows appending new code extractions without re-processing PDFs.
+        
+        Args:
+            graph_path: Path to existing knowledge_graph.json
+            stats_path: Path to existing term_statistics.json (optional)
+        """
+        print(f"\nLoading existing extraction from: {graph_path}")
+        
+        with open(graph_path, 'r') as f:
+            graph = json.load(f)
+        
+        # Restore terms from graph nodes
+        nodes = graph.get('nodes', {})
+        pdf_count = 0
+        code_count = 0
+        
+        for term_id, node in nodes.items():
+            # Reconstruct ExtractedTerm from node data
+            source_type = node.get('source_type', 'both')
+            
+            # Map source_type to TermSource enum
+            if source_type == 'pdf':
+                term_source = TermSource.PDF
+            elif source_type == 'code':
+                term_source = TermSource.CODE
+            else:
+                term_source = TermSource.BOTH
+            
+            # Map category to TermType enum
+            category = node.get('category', 'concept').upper()
+            try:
+                term_type = TermType[category]
+            except KeyError:
+                term_type = TermType.CONCEPT
+            
+            term = ExtractedTerm(
+                term=node.get('original', term_id),
+                normalized=term_id,
+                term_type=term_type,
+                source=term_source,
+                source_files=node.get('source_files', []),
+                context=node.get('definition', ''),
+                code_references=node.get('code_references', []),
+                document_frequency=node.get('document_frequency', 1),
+                term_frequency=node.get('term_frequency', 1),
+                confidence=node.get('confidence', 0.5)
+            )
+            
+            # Store in appropriate dict based on source
+            if source_type in ('pdf', 'both'):
+                self.pdf_terms[term_id] = term
+                pdf_count += 1
+            if source_type in ('code', 'both'):
+                self.code_terms[term_id] = term
+                code_count += 1
+        
+        # Restore relationships from edges
+        for edge in graph.get('edges', []):
+            rel = Relationship(
+                source_term=edge.get('source', ''),
+                target_term=edge.get('target', ''),
+                relationship_type=edge.get('type', 'related_to'),
+                weight=edge.get('weight', 1.0),
+                evidence=edge.get('evidence', '')
+            )
+            self.relationships.append(rel)
+        
+        # Restore TF-IDF stats if available
+        if stats_path and os.path.exists(stats_path):
+            with open(stats_path, 'r') as f:
+                stats = json.load(f)
+            self.total_documents = stats.get('total_documents', 0)
+            # Note: document_term_sets can't be fully restored, but total_documents is key
+        else:
+            # Estimate from graph
+            self.total_documents = graph.get('statistics', {}).get('total_sources', 0)
+        
+        print(f"  Loaded {pdf_count} PDF terms, {code_count} code terms")
+        print(f"  Loaded {len(self.relationships)} relationships")
+        print(f"  Total documents: {self.total_documents}")
+    
     # =========================================================================
     # FILTERING METHODS
     # =========================================================================
@@ -672,6 +757,135 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
     # CODE EXTRACTION
     # =========================================================================
     
+    def detect_language(self, content: str, file_path: str) -> str:
+        """
+        Detect programming language from file content.
+        
+        Returns one of: 'tal', 'cobol', 'c', 'python', 'java', 'unknown'
+        """
+        ext = Path(file_path).suffix.lower()
+        
+        # First check extension for obvious cases
+        if ext in ('.tal', '.tacl', '.ddl'):
+            return 'tal'
+        elif ext in ('.cob', '.cbl', '.cobol', '.cpy'):
+            return 'cobol'
+        elif ext in ('.py',):
+            return 'python'
+        elif ext in ('.java',):
+            return 'java'
+        elif ext in ('.c', '.h', '.cpp', '.hpp', '.cc'):
+            return 'c'
+        
+        # Content-based detection for .txt and unknown extensions
+        content_upper = content.upper()
+        content_sample = content[:5000]  # Sample first 5KB
+        
+        # TAL indicators (Transaction Application Language)
+        tal_score = 0
+        if re.search(r'\bPROC\s+\w+', content_upper):
+            tal_score += 3
+        if re.search(r'\bSUBPROC\s+\w+', content_upper):
+            tal_score += 3
+        if re.search(r'\bSTRUCT\s+\w+', content_upper):
+            tal_score += 2
+        if re.search(r'\bDEFINE\s+\w+', content_upper):
+            tal_score += 2
+        if re.search(r'\bINT\s*\(\s*\d+\s*\)', content_upper):
+            tal_score += 2
+        if re.search(r'\bSTRING\s+\.\w+', content_upper):
+            tal_score += 2
+        if re.search(r'\bCALL\s+\w+\s*\^', content_upper):
+            tal_score += 2
+        if re.search(r'\^\w+', content):  # Caret notation
+            tal_score += 1
+        if re.search(r'^!', content, re.MULTILINE):  # TAL comments
+            tal_score += 1
+        if 'LITERAL' in content_upper or 'FORWARD' in content_upper:
+            tal_score += 1
+            
+        # COBOL indicators
+        cobol_score = 0
+        if re.search(r'\bIDENTIFICATION\s+DIVISION', content_upper):
+            cobol_score += 5
+        if re.search(r'\bDATA\s+DIVISION', content_upper):
+            cobol_score += 5
+        if re.search(r'\bPROCEDURE\s+DIVISION', content_upper):
+            cobol_score += 5
+        if re.search(r'\bWORKING-STORAGE\s+SECTION', content_upper):
+            cobol_score += 3
+        if re.search(r'\b\d{2}\s+\w+.*PIC\s+', content_upper):
+            cobol_score += 3
+        if re.search(r'\bPERFORM\s+\w+', content_upper):
+            cobol_score += 2
+        if re.search(r'\bMOVE\s+\w+\s+TO\s+', content_upper):
+            cobol_score += 2
+        if re.search(r'^\s{6}', content, re.MULTILINE):  # Column 7 start
+            cobol_score += 1
+        if re.search(r'^\d{6}', content, re.MULTILINE):  # Line numbers
+            cobol_score += 1
+            
+        # Python indicators
+        python_score = 0
+        if re.search(r'^def\s+\w+\s*\(', content_sample, re.MULTILINE):
+            python_score += 3
+        if re.search(r'^class\s+\w+.*:', content_sample, re.MULTILINE):
+            python_score += 3
+        if re.search(r'^import\s+\w+', content_sample, re.MULTILINE):
+            python_score += 2
+        if re.search(r'^from\s+\w+\s+import', content_sample, re.MULTILINE):
+            python_score += 2
+        if re.search(r'^\s+def\s+__\w+__', content_sample, re.MULTILINE):
+            python_score += 2
+        if '"""' in content_sample or "'''" in content_sample:
+            python_score += 1
+            
+        # Java indicators  
+        java_score = 0
+        if re.search(r'\bpublic\s+class\s+\w+', content_sample):
+            java_score += 4
+        if re.search(r'\bprivate\s+(static\s+)?\w+\s+\w+', content_sample):
+            java_score += 2
+        if re.search(r'\bimport\s+java\.', content_sample):
+            java_score += 3
+        if re.search(r'\bpackage\s+[\w.]+;', content_sample):
+            java_score += 2
+        if re.search(r'\bpublic\s+static\s+void\s+main', content_sample):
+            java_score += 3
+            
+        # C/C++ indicators
+        c_score = 0
+        if re.search(r'^#include\s*[<"]', content_sample, re.MULTILINE):
+            c_score += 3
+        if re.search(r'^#define\s+\w+', content_sample, re.MULTILINE):
+            c_score += 2
+        if re.search(r'\bint\s+main\s*\(', content_sample):
+            c_score += 3
+        if re.search(r'\b(typedef|struct|union)\s+\w+', content_sample):
+            c_score += 2
+        if re.search(r'\w+\s*\*\s*\w+', content_sample):  # Pointers
+            c_score += 1
+        if re.search(r'->\w+', content_sample):  # Arrow operator
+            c_score += 1
+            
+        # Pick highest score
+        scores = {
+            'tal': tal_score,
+            'cobol': cobol_score,
+            'python': python_score,
+            'java': java_score,
+            'c': c_score
+        }
+        
+        best_lang = max(scores, key=scores.get)
+        best_score = scores[best_lang]
+        
+        # Require minimum confidence
+        if best_score >= 3:
+            return best_lang
+        
+        return 'unknown'
+    
     def extract_from_code(self, file_path: str) -> List[ExtractedTerm]:
         """Extract domain-relevant symbols from code file"""
         
@@ -682,13 +896,17 @@ Extract up to 30 most important domain terms. Types: business_concept, message_t
             print(f"    Error reading code: {e}")
             return []
         
-        ext = Path(file_path).suffix.lower()
+        # Auto-detect language from content
+        lang = self.detect_language(content, file_path)
         
-        if ext in ('.tal', '.tacl', '.ddl'):
+        if lang == 'tal':
             return self._extract_from_tal(content, file_path)
-        elif ext in ('.cob', '.cbl', '.cobol', '.cpy'):
+        elif lang == 'cobol':
             return self._extract_from_cobol(content, file_path)
+        elif lang in ('c', 'java', 'python'):
+            return self._extract_from_c_like(content, file_path)
         else:
+            # Try generic extraction for unknown
             return self._extract_from_c_like(content, file_path)
     
     def _extract_from_tal(self, content: str, file_path: str) -> List[ExtractedTerm]:
@@ -1408,10 +1626,20 @@ def main():
                         help="Use heuristic extraction only")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output")
+    parser.add_argument("--append", "-a", action="store_true",
+                        help="Append to existing extraction (load --graph and --stats, skip --docs)")
     
     args = parser.parse_args()
     
-    if not args.docs and not args.code:
+    # Validate arguments
+    if args.append:
+        if not args.code:
+            print("Error: --append requires --code to specify code directories to add")
+            sys.exit(1)
+        if not os.path.exists(args.graph):
+            print(f"Error: --append requires existing graph file: {args.graph}")
+            sys.exit(1)
+    elif not args.docs and not args.code:
         print("Error: Specify --docs and/or --code directories")
         sys.exit(1)
     
@@ -1419,9 +1647,9 @@ def main():
     print("KNOWLEDGE EXTRACTOR")
     print("=" * 60)
     
-    # Create LLM provider
+    # Create LLM provider (only needed if processing docs)
     llm_provider = None
-    if not args.no_llm and LLM_AVAILABLE:
+    if not args.append and not args.no_llm and LLM_AVAILABLE:
         try:
             llm_provider = create_provider(args.provider, args.model)
             print(f"\nLLM Provider: {args.provider} ({llm_provider.model})")
@@ -1431,8 +1659,14 @@ def main():
     # Create extractor
     extractor = KnowledgeExtractor(llm_provider)
     
-    # Find and process PDF/document files
-    if args.docs:
+    # If appending, load existing state first
+    if args.append:
+        print("\n[APPEND MODE] Loading existing extraction...")
+        stats_path = args.stats if os.path.exists(args.stats) else None
+        extractor.load_existing_state(args.graph, stats_path)
+    
+    # Find and process PDF/document files (skip if appending)
+    if args.docs and not args.append:
         doc_extensions = {'.pdf', '.txt', '.md', '.rst', '.doc', '.docx'}
         doc_files = find_files(args.docs, doc_extensions)
         print(f"\nFound {len(doc_files)} document files")
@@ -1458,16 +1692,46 @@ def main():
                 else:
                     extractor.pdf_terms[term.normalized] = term
             print(f"found {len(terms)} terms")
+    elif args.append:
+        print("\n[APPEND MODE] Skipping document processing (using existing)")
     
     # Find and process code files
     if args.code:
-        code_extensions = {'.tal', '.tacl', '.ddl', '.cob', '.cbl', '.cobol', '.cpy',
-                          '.c', '.h', '.cpp', '.hpp', '.java', '.py'}
+        # Accept wide range of extensions - language will be auto-detected from content
+        code_extensions = {
+            # TAL/TACL
+            '.tal', '.tacl', '.ddl',
+            # COBOL
+            '.cob', '.cbl', '.cobol', '.cpy',
+            # C/C++
+            '.c', '.h', '.cpp', '.hpp', '.cc', '.hh',
+            # Java
+            '.java',
+            # Python
+            '.py',
+            # Other common
+            '.js', '.ts', '.go', '.rs', '.rb', '.cs',
+            # Text files (language auto-detected)
+            '.txt', '.src', '.inc', '.include',
+        }
         code_files = find_files(args.code, code_extensions)
         print(f"\nFound {len(code_files)} code files")
         
+        # Track language stats
+        lang_counts = {}
+        
         for i, (file_path, ext) in enumerate(code_files):
             print(f"  [{i+1}/{len(code_files)}] {Path(file_path).name}...", end=" ", flush=True)
+            
+            # Read file to detect language
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                lang = extractor.detect_language(content, file_path)
+                lang_counts[lang] = lang_counts.get(lang, 0) + 1
+            except:
+                lang = 'unknown'
+            
             terms = extractor.extract_from_code(file_path)
             
             # Record for TF-IDF
@@ -1484,7 +1748,13 @@ def main():
                     existing.confidence += 0.1  # Small boost for each additional file
                 else:
                     extractor.code_terms[term.normalized] = term
-            print(f"found {len(terms)} terms")
+            print(f"[{lang}] {len(terms)} terms")
+        
+        # Show language summary
+        if lang_counts:
+            print("\n  Language detection summary:")
+            for lang, count in sorted(lang_counts.items(), key=lambda x: -x[1]):
+                print(f"    {lang}: {count} files")
     
     # Cross-reference
     print("\nCross-referencing terms...")
