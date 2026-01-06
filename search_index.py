@@ -13,43 +13,233 @@ and TF-IDF weighted scoring. Leverages extracted domain knowledge to:
 - Show related concepts in search results
 
 ================================================================================
+ARCHITECTURE
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            SEARCH PIPELINE                                  │
+│                                                                             │
+│  USER QUERY              PROCESSING STAGES                    RESULTS       │
+│  ──────────              ─────────────────                    ───────       │
+│                                                                             │
+│  "OFAC screening"                                                           │
+│        │                                                                    │
+│        ▼                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ STAGE 1: Query Expansion (--expand-query)                           │    │
+│  │                                                                     │    │
+│  │  Knowledge Graph lookup:                                            │    │
+│  │    "OFAC" → co_occurs_with: [sanctions, SDN, screening]             │    │
+│  │           → implements: [screen_ofac, validate_ofac]                │    │
+│  │                                                                     │    │
+│  │  Expanded: "OFAC screening sanctions SDN screen_ofac"               │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│        │                                                                    │
+│        ▼                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ STAGE 2: Multi-Signal Search                                        │    │
+│  │                                                                     │    │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │    │
+│  │  │ Vector       │  │ BM25         │  │ Concept      │               │    │
+│  │  │ Similarity   │  │ Lexical      │  │ Matching     │               │    │
+│  │  │ (semantic)   │  │ (exact term) │  │ (vocabulary) │               │    │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘               │    │
+│  │         │                 │                 │                       │    │
+│  │         └────────────┬────┴─────────────────┘                       │    │
+│  │                      ▼                                              │    │
+│  │        Reciprocal Rank Fusion (RRF)                                 │    │
+│  │        RRF_score = Σ 1/(k + rank)                                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│        │                                                                    │
+│        ▼                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ STAGE 3: TF-IDF Boosting (--tfidf-boost, optional)                  │    │
+│  │                                                                     │    │
+│  │  For each result:                                                   │    │
+│  │    - Check if matched terms have high TF-IDF scores                 │    │
+│  │    - Boost score by up to 0.3 for distinctive term matches          │    │
+│  │    - Re-rank results by boosted scores                              │    │
+│  │                                                                     │    │
+│  │  Example: "UETR" (TF-IDF=3.0) match → +0.2 boost                    │    │
+│  │           "wire" (TF-IDF=0.5) match → +0.05 boost                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│        │                                                                    │
+│        ▼                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ STAGE 4: Result Display                                             │    │
+│  │                                                                     │    │
+│  │  Result #1  |  Score: 0.892  |  Type: CODE                          │    │
+│  │  ────────────────────────────────────────                           │    │
+│  │  📁 File: /src/compliance/ofac_check.tal                            │    │
+│  │  🔧 Procedure: SCREEN_OFAC                                          │    │
+│  │  🏷️  Concepts: OFAC, sanctions, compliance                          │    │
+│  │  🔗 Related: SDN_LIST, VALIDATE_BIC, CHECK_SANCTIONS  ← from KG     │    │
+│  │                                                                     │    │
+│  │  📝 Content:                                                        │    │
+│  │     PROC SCREEN_OFAC(customer_name, result);                        │    │
+│  │     ...                                                             │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+BM25 LEXICAL SEARCH
+================================================================================
+
+BM25 (Best Matching 25) provides lexical retrieval to complement vector search:
+
+    BM25 score(D, Q) = Σ IDF(qi) × (f(qi,D) × (k1+1)) / (f(qi,D) + k1×(1-b+b×|D|/avgdl))
+
+    where:
+    - f(qi, D) = frequency of term qi in document D
+    - |D| = document length
+    - avgdl = average document length
+    - k1 = term frequency saturation (default: 1.5)
+    - b = length normalization (default: 0.75)
+
+BM25 excels at:
+- Exact term matching (acronyms like UETR, OFAC, BIC)
+- Technical terms that vector embeddings may miss
+- Complementing semantic search with lexical precision
+
+================================================================================
+RECIPROCAL RANK FUSION (RRF)
+================================================================================
+
+RRF combines results from multiple retrievers using ranks, not scores:
+
+    RRF_score(d) = Σ 1/(k + rank(d))
+
+    where k = 60 (standard constant)
+
+Example:
+    Vector:  [A: rank 1, B: rank 2, C: rank 3]
+    BM25:    [B: rank 1, D: rank 2, A: rank 3]
+
+    RRF scores:
+      A: 1/61 + 1/63 = 0.0323
+      B: 1/62 + 1/61 = 0.0325  ← Winner (found by both)
+      C: 1/63        = 0.0159
+      D: 1/62        = 0.0161
+
+Benefits:
+- Robust to score distribution differences
+- No normalization needed
+- Proven in production (Elasticsearch, Pinecone)
+
+================================================================================
+KNOWLEDGE GRAPH CLASS
+================================================================================
+
+The KnowledgeGraph class provides fast lookups for search enhancement:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  class KnowledgeGraph:                                                      │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ Data Structures                                                     │    │
+│  │                                                                     │    │
+│  │  nodes: Dict[str, Dict]                                             │    │
+│  │    └─ "ofac" → {id, label, type, tf_idf_score, co_occurs_with}      │    │
+│  │                                                                     │    │
+│  │  _outgoing_edges: Dict[str, List[Dict]]                             │    │
+│  │    └─ "ofac" → [{source: ofac, target: sanctions, type: co_occurs}] │    │
+│  │                                                                     │    │
+│  │  _incoming_edges: Dict[str, List[Dict]]                             │    │
+│  │    └─ "sanctions" → [{source: ofac, target: sanctions, ...}]        │    │
+│  │                                                                     │    │
+│  │  _label_to_id: Dict[str, str]                                       │    │
+│  │    └─ "OFAC" → "ofac" (case-insensitive lookup)                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ Key Methods                                                         │    │
+│  │                                                                     │    │
+│  │  get_node(term) → Dict                                              │    │
+│  │    Returns node data for a term (by ID or label)                    │    │
+│  │                                                                     │    │
+│  │  get_related_terms(term, max_terms=10) → List[(term, type, weight)] │    │
+│  │    BFS traversal to find related terms via edges                    │    │
+│  │                                                                     │    │
+│  │  get_tfidf_score(term) → float                                      │    │
+│  │    Returns TF-IDF score for boosting (0.0 if not found)             │    │
+│  │                                                                     │    │
+│  │  expand_query(query) → str                                          │    │
+│  │    Expands query by adding related terms                            │    │
+│  │    "OFAC" → "ofac sanctions sdn screening"                          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+TF-IDF BOOSTING ALGORITHM
+================================================================================
+
+The apply_tfidf_boost() function re-ranks results:
+
+    Input: List of search results, Knowledge Graph, Original query
+    
+    For each result:
+        boost = 0.0
+        
+        # Check matched concepts
+        for concept in result.matched_concepts:
+            if concept has high TF-IDF:
+                boost += 0.2 × (tfidf / max_tfidf)
+        
+        # Check content text
+        for query_term in original_query:
+            if term in result.text and has high TF-IDF:
+                boost += 0.1 × (tfidf / max_tfidf)
+        
+        # Check procedure name
+        if query_term in procedure_name:
+            boost += 0.15 × (tfidf / max_tfidf)
+        
+        # Cap total boost at 0.3
+        result.score += min(boost, 0.3)
+    
+    Output: Results re-sorted by boosted scores
+
+================================================================================
+AUTO-LOADING KNOWLEDGE GRAPH
+================================================================================
+
+When index was built with --knowledge-graph, the KG is embedded:
+
+    ./my_index/
+    ├── index.pkl
+    ├── index_meta.json      ← Contains: "knowledge_graph": true
+    └── knowledge_graph.json ← Auto-loaded by search
+
+Search auto-loading logic:
+    1. If --knowledge-graph flag provided → use that path
+    2. Else if ./index/knowledge_graph.json exists → auto-load
+    3. Else → search without KG features
+    4. If --no-kg flag → skip auto-loading
+
+================================================================================
 USAGE
 ================================================================================
 
     # Basic semantic search
     python search_index.py --index ./my_index --query "OFAC screening"
     
-    # With knowledge graph query expansion
-    python search_index.py --index ./my_index --query "OFAC screening" \\
-        --knowledge-graph ./knowledge_graph.json --expand-query
+    # With knowledge graph query expansion (auto-loaded from index)
+    python search_index.py --index ./my_index --query "OFAC screening" --expand-query
     
-    # Interactive mode with knowledge graph
-    python search_index.py --index ./my_index --interactive \\
-        --knowledge-graph ./knowledge_graph.json
+    # With TF-IDF boosting
+    python search_index.py --index ./my_index --query "OFAC" --tfidf-boost
+    
+    # Both features
+    python search_index.py --index ./my_index --query "OFAC" -e -b
+    
+    # Interactive mode
+    python search_index.py --index ./my_index --interactive
     
     # With LLM analysis
     python search_index.py --index ./my_index --query "wire transfer" --analyze
-
-================================================================================
-KNOWLEDGE GRAPH FEATURES
-================================================================================
-
-Query Expansion (--expand-query):
-    Original: "OFAC screening"
-    Expanded: "OFAC screening sanctions SDN compliance screen_ofac"
-    
-    Uses relationships from knowledge graph:
-    - co_occurs_with: Terms that appear together in documents
-    - implements: Procedures that implement concepts
-    - contains: Structure fields
-    - related_to: Semantically related terms
-
-TF-IDF Boosting (--tfidf-boost):
-    Boosts scores for matches on distinctive terms (high TF-IDF score).
-    Terms that appear in few documents are considered more important.
-
-Related Terms Display:
-    Shows related concepts in search results when knowledge graph is loaded.
 
 ================================================================================
 ARGUMENTS
@@ -64,40 +254,58 @@ ARGUMENTS
     --verbose         Show more details in results
     
     Knowledge Graph Options:
-    --knowledge-graph Path to knowledge_graph.json from knowledge_extractor
+    --knowledge-graph Path to knowledge_graph.json (overrides auto-load)
     --expand-query    Expand query using related terms from knowledge graph
     --tfidf-boost     Boost scores based on TF-IDF (distinctive terms)
-    --show-related    Show related terms in results (default: on with KG)
+    --no-related      Don't show related terms in results
+    --no-kg           Don't auto-load embedded knowledge graph
     
     LLM Options:
     --analyze         Send results to LLM for analysis
     --provider        LLM provider (default: tachyon)
     --model           LLM model name
     --min-score       Minimum score for LLM analysis (default: 0.50)
+
+================================================================================
+INTERACTIVE COMMANDS
+================================================================================
+
+    <query>           Search for text
+    :analyze <query>  Search and analyze with LLM
+    :cap <capability> Search by business capability
+    :code <query>     Search only in code
+    :doc <query>      Search only in documents
+    :top <n>          Set number of results
+    :verbose          Toggle verbose output
+    
+    Knowledge Graph (when loaded):
+    :expand           Toggle query expansion ON/OFF
+    :boost            Toggle TF-IDF boosting ON/OFF
+    :related          Toggle related terms display
+    :lookup <term>    Show term details (TF-IDF, relationships)
+    :graph            Show knowledge graph statistics
 """
 
 import sys
 import os
+import re
 import argparse
 import json
 from pathlib import Path
-from typing import List, Dict, Set, Optional, Tuple
+from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
-# Add current directory to path
+# Add current directory to path for local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from unified_indexer import IndexingPipeline, SourceType
 
-# Import LLM provider
+# Import LLM provider (optional dependency)
 try:
     from llm_provider import (
         LLMProvider,
         create_provider,
-        analyze_search_results,
-        format_search_results_for_llm,
-        WIRE_PAYMENTS_SYSTEM_PROMPT,
-        ContentType
+        analyze_search_results
     )
     LLM_AVAILABLE = True
 except ImportError:
@@ -109,6 +317,12 @@ DEFAULT_KEYWORDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # =============================================================================
 # KNOWLEDGE GRAPH SUPPORT
+#
+# The KnowledgeGraph class loads and indexes the knowledge_graph.json file
+# produced by knowledge_extractor.py. It provides fast lookups for:
+#   - Query expansion: finding related terms to add to searches
+#   - TF-IDF boosting: getting distinctiveness scores for terms
+#   - Result enrichment: showing related concepts in search results
 # =============================================================================
 
 class KnowledgeGraph:
@@ -125,6 +339,25 @@ class KnowledgeGraph:
         nodes: Dict mapping normalized term to node data
         edges: List of relationship edges
         statistics: Summary statistics from the graph
+        
+    Example node:
+        {
+            "id": "ofac",
+            "label": "OFAC",
+            "type": "acronym",
+            "tf_idf_score": 2.5,
+            "term_frequency": 45,
+            "document_frequency": 3,
+            "co_occurs_with": ["sanctions", "sdn", "screening"]
+        }
+    
+    Example edge:
+        {
+            "source": "ofac",
+            "target": "sanctions",
+            "type": "co_occurs_with",
+            "evidence": "Co-occurred in 5 documents"
+        }
     """
     
     def __init__(self, graph_path: str):
@@ -134,51 +367,79 @@ class KnowledgeGraph:
         Args:
             graph_path: Path to knowledge_graph.json
         """
-        self.nodes: Dict[str, Dict] = {}
-        self.edges: List[Dict] = []
-        self.statistics: Dict = {}
+        # Primary data structures
+        self.nodes: Dict[str, Dict] = {}      # node_id -> node data
+        self.edges: List[Dict] = []            # list of all edges
+        self.statistics: Dict = {}             # summary stats from extractor
         
-        # Index structures for fast lookup
-        self._outgoing_edges: Dict[str, List[Dict]] = defaultdict(list)  # term -> edges from term
-        self._incoming_edges: Dict[str, List[Dict]] = defaultdict(list)  # term -> edges to term
-        self._label_to_id: Dict[str, str] = {}  # original label -> normalized id
+        # Index structures for O(1) lookups
+        # These are built during _load() for fast graph traversal
+        self._outgoing_edges: Dict[str, List[Dict]] = defaultdict(list)  # source -> [edges]
+        self._incoming_edges: Dict[str, List[Dict]] = defaultdict(list)  # target -> [edges]
+        self._label_to_id: Dict[str, str] = {}  # "OFAC" -> "ofac" (case-insensitive)
         
         self._load(graph_path)
     
     def _load(self, graph_path: str):
-        """Load and index the knowledge graph."""
+        """
+        Load and index the knowledge graph from JSON.
+        
+        Builds index structures for fast lookups:
+        - nodes dict for direct ID access
+        - _label_to_id for case-insensitive label lookup
+        - _outgoing_edges for forward traversal (A→B)
+        - _incoming_edges for reverse traversal (B←A)
+        """
         with open(graph_path, 'r') as f:
             data = json.load(f)
         
-        # Load nodes (keyed by normalized id)
+        # Index nodes by their normalized ID
+        # Also create label→id mapping for flexible lookups
         for node in data.get('nodes', []):
-            node_id = node['id']
+            node_id = node.get('id')
+            if not node_id:
+                continue  # Skip nodes without ID
             self.nodes[node_id] = node
-            # Also index by original label for flexible lookup
+            # Allow lookup by original label (e.g., "OFAC" → "ofac")
             if 'label' in node:
                 self._label_to_id[node['label'].lower()] = node_id
         
-        # Load and index edges
+        # Index edges for fast graph traversal
+        # Build both forward and reverse indexes
         self.edges = data.get('edges', [])
         for edge in self.edges:
-            source = edge['source']
-            target = edge['target']
+            source = edge.get('source')
+            target = edge.get('target')
+            if not source or not target:
+                continue  # Skip malformed edges
+            # Forward: source → [all edges from source]
             self._outgoing_edges[source].append(edge)
+            # Reverse: target → [all edges to target]
             self._incoming_edges[target].append(edge)
         
         self.statistics = data.get('statistics', {})
     
     def normalize(self, term: str) -> str:
-        """Normalize a term to match node IDs."""
-        import re
+        """
+        Normalize a term to match node IDs.
+        
+        Transforms: "Wire-Transfer" → "wire_transfer"
+        - Lowercase
+        - Replace spaces/hyphens with underscores
+        - Remove special characters
+        """
         normalized = term.lower()
-        normalized = re.sub(r'[-\s]+', '_', normalized)
-        normalized = re.sub(r'[^a-z0-9_]', '', normalized)
+        normalized = re.sub(r'[-\s]+', '_', normalized)  # spaces/hyphens → underscore
+        normalized = re.sub(r'[^a-z0-9_]', '', normalized)  # remove special chars
         return normalized
     
     def get_node(self, term: str) -> Optional[Dict]:
         """
         Get node data for a term.
+        
+        Tries multiple lookup strategies:
+        1. Normalized form (wire_transfer)
+        2. Label lookup (WIRE_TRANSFER → wire_transfer)
         
         Args:
             term: Term to look up (original or normalized form)
@@ -186,12 +447,12 @@ class KnowledgeGraph:
         Returns:
             Node dict with id, label, type, tf_idf_score, etc. or None
         """
-        # Try normalized form
+        # Strategy 1: Try normalized form directly
         normalized = self.normalize(term)
         if normalized in self.nodes:
             return self.nodes[normalized]
         
-        # Try label lookup
+        # Strategy 2: Try label lookup (case-insensitive)
         if term.lower() in self._label_to_id:
             node_id = self._label_to_id[term.lower()]
             return self.nodes.get(node_id)
@@ -205,6 +466,9 @@ class KnowledgeGraph:
         """
         Get terms related to the given term via graph relationships.
         
+        Uses BFS (Breadth-First Search) to traverse the graph and find
+        connected terms. Can follow relationships in both directions.
+        
         Args:
             term: Term to find relationships for
             relationship_types: Filter by relationship type (None = all types)
@@ -215,20 +479,28 @@ class KnowledgeGraph:
         Returns:
             List of (related_term, relationship_type, weight) tuples
             Weight is based on co-occurrence count or 1.0 for structural relationships
+            
+        Example:
+            get_related_terms("OFAC") → [
+                ("sanctions", "co_occurs_with", 5.0),
+                ("SDN", "co_occurs_with", 3.0),
+                ("SCREEN_OFAC", "rev_implements", 1.0)
+            ]
         """
         normalized = self.normalize(term)
         related = []
-        seen = {normalized}
+        seen = {normalized}  # Track visited nodes to avoid cycles
         
-        # BFS to find related terms
+        # BFS traversal - process nodes level by level
         current_level = [normalized]
         
         for depth in range(max_depth):
             next_level = []
             
             for current in current_level:
-                # Check outgoing edges
+                # === Check OUTGOING edges (current → target) ===
                 for edge in self._outgoing_edges.get(current, []):
+                    # Skip if relationship type doesn't match filter
                     if relationship_types and edge['type'] not in relationship_types:
                         continue
                     
@@ -236,7 +508,7 @@ class KnowledgeGraph:
                     if target not in seen:
                         seen.add(target)
                         
-                        # Calculate weight (co-occurrence count or 1.0)
+                        # Extract weight from evidence (e.g., "Co-occurred in 5 documents")
                         weight = 1.0
                         if 'Co-occurred in' in edge.get('evidence', ''):
                             try:
@@ -245,12 +517,14 @@ class KnowledgeGraph:
                             except:
                                 pass
                         
+                        # Get display label from node, fallback to ID
                         node = self.nodes.get(target, {})
                         label = node.get('label', target)
                         related.append((label, edge['type'], weight))
                         next_level.append(target)
                 
-                # Check incoming edges (reverse relationships)
+                # === Check INCOMING edges (source → current) ===
+                # These are "reverse" relationships
                 for edge in self._incoming_edges.get(current, []):
                     if relationship_types and edge['type'] not in relationship_types:
                         continue
@@ -402,11 +676,26 @@ def load_knowledge_graph(graph_path: str) -> Optional[KnowledgeGraph]:
 
 # =============================================================================
 # VOCABULARY LOADING
+#
+# Loads the vocabulary (keywords.json or vocabulary.json) that defines
+# domain-specific terms and their metadata for concept matching.
 # =============================================================================
 
 
 def load_vocabulary(vocab_path: str) -> list:
-    """Load vocabulary from JSON file"""
+    """
+    Load vocabulary from JSON file.
+    
+    Supports two formats:
+    1. List format: [{keywords, metadata, ...}, ...]
+    2. Dict format: {entries: [{...}, ...]}
+    
+    Args:
+        vocab_path: Path to vocabulary JSON file
+        
+    Returns:
+        List of vocabulary entries
+    """
     if not os.path.exists(vocab_path):
         print(f"Error: Vocabulary file not found: {vocab_path}")
         print(f"Please ensure 'keywords.json' exists in the same directory as this script,")
@@ -416,6 +705,7 @@ def load_vocabulary(vocab_path: str) -> list:
     with open(vocab_path, 'r') as f:
         data = json.load(f)
     
+    # Handle both formats: direct list or dict with 'entries' key
     if isinstance(data, list):
         return data
     elif isinstance(data, dict):
@@ -425,30 +715,48 @@ def load_vocabulary(vocab_path: str) -> list:
         sys.exit(1)
 
 
+# =============================================================================
+# RESULT DISPLAY
+#
+# Functions for formatting and printing search results with optional
+# knowledge graph context (related terms, TF-IDF scores).
+# =============================================================================
+
+
 def print_result(result, index: int, verbose: bool = False, 
                  knowledge_graph: Optional[KnowledgeGraph] = None,
                  show_related: bool = True):
     """
     Print a single search result with optional knowledge graph context.
     
+    Displays:
+    - Score and source type
+    - File path, line numbers, procedure name
+    - Matched concepts and business capabilities
+    - Related terms from knowledge graph (if loaded)
+    - Content preview
+    
     Args:
-        result: Search result object
-        index: Result index for numbering
+        result: Search result object from pipeline.search()
+        index: Result index for numbering (0-based)
         verbose: Show detailed scores and metadata
         knowledge_graph: Optional KG for showing related terms
         show_related: Whether to show related terms from KG
     """
     chunk = result.chunk
     
+    # === Header: Score and type ===
     print(f"\n{'─' * 60}")
     score_info = f"Score: {result.combined_score:.3f}"
     if verbose:
-        score_info += f" (v:{result.vector_score:.3f} c:{result.concept_score:.3f} k:{result.keyword_score:.3f})"
+        # Show component scores: vector, bm25, concept
+        score_info += f" (v:{result.vector_score:.3f} b:{result.bm25_score:.3f} c:{result.concept_score:.3f})"
     print(f"Result #{index + 1}  |  {score_info}  |  Type: {chunk.source_type.value.upper()}")
     if verbose:
         print(f"Method: {result.retrieval_method}")
     print(f"{'─' * 60}")
     
+    # === Source location ===
     source_ref = chunk.source_ref
     if source_ref.file_path:
         print(f"📁 File: {source_ref.file_path}")
@@ -574,21 +882,45 @@ def search_once(pipeline: IndexingPipeline,
     """
     Perform a semantic search with optional knowledge graph enhancement.
     
+    This is the main search function that orchestrates the search pipeline:
+    
+    1. QUERY EXPANSION (if enabled):
+       - Look up query terms in knowledge graph
+       - Add related terms (co-occurring, implementing procedures)
+       - "OFAC" → "OFAC sanctions SDN screening"
+    
+    2. MULTI-SIGNAL SEARCH:
+       - Vector similarity (semantic meaning)
+       - Concept matching (domain vocabulary)
+       - Keyword matching (exact terms)
+       - Combined into single score
+    
+    3. TF-IDF BOOSTING (if enabled):
+       - Look up TF-IDF scores for query terms
+       - Boost results matching distinctive terms
+       - Re-rank by boosted scores
+    
+    4. RESULT DISPLAY:
+       - Show file, procedure, concepts
+       - Show related terms from knowledge graph
+       - Show content preview
+    
     Args:
-        pipeline: The indexing pipeline
-        query: Search query
-        top_k: Number of results
+        pipeline: The indexing pipeline with loaded index
+        query: Search query (natural language)
+        top_k: Number of results to return
         source_type: Filter by type (all, code, document, log)
-        verbose: Show full content
+        verbose: Show detailed scores and metadata
         knowledge_graph: Optional KnowledgeGraph for expansion/boosting
-        expand_query: Expand query using related terms from KG
-        tfidf_boost: Boost scores based on TF-IDF scores
-        show_related: Show related terms in results
+        expand_query: If True, expand query using related terms from KG
+        tfidf_boost: If True, boost scores based on TF-IDF scores
+        show_related: If True, show related terms in results
         
     Returns:
         List of search results
     """
     
+    # === Step 1: Parse source type filter ===
     source_types = None
     if source_type == "code":
         source_types = [SourceType.CODE]
@@ -596,16 +928,19 @@ def search_once(pipeline: IndexingPipeline,
         source_types = [SourceType.DOCUMENT]
     elif source_type == "log":
         source_types = [SourceType.LOG]
+    # "all" leaves source_types as None (no filter)
     
-    # Query expansion using knowledge graph
+    # === Step 2: Query expansion using knowledge graph ===
     search_query = query
     if knowledge_graph and expand_query:
+        # expand_query() looks up each term and adds related terms
         expanded = knowledge_graph.expand_query(query)
         if expanded != query.lower():
             search_query = expanded
             print(f"\n🔎 Original query: \"{query}\"")
             print(f"📖 Expanded query: \"{search_query}\"")
         else:
+            # No expansion happened (terms not in KG)
             print(f"\n🔎 Searching for: \"{query}\"")
     else:
         print(f"\n🔎 Searching for: \"{query}\"")
@@ -613,20 +948,29 @@ def search_once(pipeline: IndexingPipeline,
     if source_types:
         print(f"   Filtered to: {source_type}")
     
-    # Perform search (request more results if we're going to re-rank)
+    # === Step 3: Execute the search ===
+    # If TF-IDF boosting is enabled, fetch extra results for re-ranking
+    # This ensures we have enough candidates after re-ranking
     fetch_k = top_k * 2 if tfidf_boost and knowledge_graph else top_k
+    
+    # pipeline.search() does the heavy lifting:
+    # - Embeds the query
+    # - Finds similar vectors (semantic search)
+    # - Matches concepts (domain vocabulary)
+    # - Combines scores from multiple signals
     results = pipeline.search(search_query, top_k=fetch_k, source_types=source_types)
     
     if not results:
         print("\n⚠️  No results found.")
         return results
     
-    # TF-IDF boosting: re-rank results based on TF-IDF scores
+    # === Step 4: TF-IDF boosting (re-rank results) ===
+    # This step boosts results that match distinctive terms
     if knowledge_graph and tfidf_boost and results:
         results = apply_tfidf_boost(results, knowledge_graph, query)
-        results = results[:top_k]  # Trim to requested count
+        results = results[:top_k]  # Trim to requested count after re-ranking
     
-    # Print results
+    # === Step 5: Display results ===
     print(f"\n{'═' * 60}")
     print(f"Found {len(results)} result(s)")
     if knowledge_graph and (expand_query or tfidf_boost):
@@ -638,6 +982,7 @@ def search_once(pipeline: IndexingPipeline,
         print(f"   Knowledge graph: {', '.join(features)}")
     print(f"{'═' * 60}")
     
+    # print_result() shows file, procedure, concepts, related terms, content
     for i, result in enumerate(results):
         print_result(result, i, verbose, knowledge_graph, show_related)
     
@@ -654,69 +999,418 @@ def apply_tfidf_boost(results, knowledge_graph: KnowledgeGraph,
     Terms with high TF-IDF (distinctive terms) get a score boost.
     This helps surface results that match rare/specific terminology.
     
+    Algorithm:
+        1. Extract query terms and look up their TF-IDF scores
+        2. For each result, calculate boost based on:
+           - Matched concepts (+0.2 max per term)
+           - Content text matches (+0.1 max per term)
+           - Procedure name matches (+0.15 max per term)
+        3. Normalize boosts by max TF-IDF to keep scale consistent
+        4. Cap total boost at 0.3 to prevent overwhelming base score
+        5. Re-sort results by boosted score
+    
     Args:
-        results: List of search results
+        results: List of search results from pipeline.search()
         knowledge_graph: KnowledgeGraph with TF-IDF scores
         original_query: Original query for term extraction
         
     Returns:
-        Re-ranked list of results
+        Re-ranked list of results with boosted scores
+        
+    Example:
+        Query: "UETR validation"
+        UETR has TF-IDF=3.0 (distinctive), validation has TF-IDF=0.5 (common)
+        
+        Result matching "UETR" in procedure name:
+            boost = 0.15 * (3.0/3.0) = 0.15
+        
+        Result matching "validation" in text:
+            boost = 0.1 * (0.5/3.0) = 0.017
     """
-    # Extract query terms
+    # Step 1: Extract query terms and get their TF-IDF scores from knowledge graph
     query_terms = original_query.lower().split()
     
-    # Get TF-IDF scores for query terms
-    term_scores = {}
+    term_scores = {}  # term -> TF-IDF score
     for term in query_terms:
         score = knowledge_graph.get_tfidf_score(term)
         if score > 0:
             term_scores[term] = score
     
+    # If no query terms have TF-IDF data, return results unchanged
     if not term_scores:
-        return results  # No TF-IDF data, return unchanged
+        return results
     
-    # Calculate boost for each result
+    # Step 2: Calculate boost for each result
     boosted_results = []
-    max_tfidf = max(term_scores.values()) if term_scores else 1.0
+    max_tfidf = max(term_scores.values()) if term_scores else 1.0  # For normalization
     
     for result in results:
         boost = 0.0
         chunk = result.chunk
         
-        # Check matched concepts
+        # --- Boost for concept matches ---
+        # Concepts are domain terms matched from vocabulary
+        # These are high-value matches, so boost is larger (0.2 max)
         for concept in (result.matched_concepts or []):
             concept_lower = concept.lower()
             for term, tfidf in term_scores.items():
                 if term in concept_lower:
-                    # Normalize boost to 0-0.2 range
+                    # Normalize: distinctive terms (high TF-IDF) get full boost
                     boost += 0.2 * (tfidf / max_tfidf)
         
-        # Check content text
+        # --- Boost for content text matches ---
+        # Raw text matches are less precise, smaller boost (0.1 max)
         text_lower = chunk.text.lower()
         for term, tfidf in term_scores.items():
             if term in text_lower:
-                # Smaller boost for text matches
                 boost += 0.1 * (tfidf / max_tfidf)
         
-        # Check procedure name
+        # --- Boost for procedure name matches ---
+        # Procedure names are meaningful identifiers, medium boost (0.15 max)
         if chunk.source_ref.procedure_name:
             proc_lower = chunk.source_ref.procedure_name.lower()
             for term, tfidf in term_scores.items():
                 if term in proc_lower:
                     boost += 0.15 * (tfidf / max_tfidf)
         
-        # Apply boost (cap at 0.3 total boost)
+        # Cap total boost at 0.3 to prevent runaway scores
         boost = min(boost, 0.3)
         
-        # Create new result with boosted score
-        # We store the boost in a simple way by modifying combined_score
+        # Apply boost to combined score
         result.combined_score = result.combined_score + boost
         boosted_results.append(result)
     
-    # Re-sort by boosted score
+    # Step 3: Re-sort by boosted scores (highest first)
     boosted_results.sort(key=lambda r: -r.combined_score)
     
     return boosted_results
+
+
+# =============================================================================
+# QUERY DECOMPOSITION
+#
+# Long queries with multiple concepts often perform poorly because:
+# - Different concepts compete for attention in the embedding
+# - A single query mixes unrelated terms
+#
+# Query decomposition splits long queries into focused sub-queries:
+# "How does OFAC screening work for wire transfers with BIC validation?"
+#   → ["OFAC screening", "wire transfers", "BIC validation"]
+#
+# Each sub-query is searched separately, then results are fused via RRF.
+# =============================================================================
+
+
+def extract_domain_keywords(query: str, 
+                            vocabulary: list,
+                            knowledge_graph: Optional[KnowledgeGraph] = None) -> List[Tuple[str, str]]:
+    """
+    Extract domain-specific keywords from a query.
+    
+    Matches query terms against vocabulary entries and knowledge graph nodes
+    to identify domain concepts.
+    
+    Args:
+        query: The user's search query
+        vocabulary: List of vocabulary entries from keywords.json (or dict with 'entries' key)
+        knowledge_graph: Optional KnowledgeGraph for additional terms
+        
+    Returns:
+        List of (keyword, source) tuples where source is 'vocab' or 'kg'
+        
+    Example:
+        query = "How does OFAC sanctions screening work for wire transfers?"
+        returns = [("OFAC", "vocab"), ("sanctions", "kg"), ("wire transfer", "vocab")]
+    """
+    query_lower = query.lower()
+    keywords = []
+    seen = set()
+    
+    # Handle vocabulary as dict with 'entries' key or list
+    if isinstance(vocabulary, dict):
+        vocab_entries = vocabulary.get('entries', [])
+    else:
+        vocab_entries = vocabulary if vocabulary else []
+    
+    # Build vocabulary term lookup
+    vocab_terms = {}  # normalized_term -> original_form
+    for entry in vocab_entries:
+        if isinstance(entry, str):
+            # Simple string entry
+            term_lower = entry.lower().strip()
+            if term_lower and len(term_lower) >= 2:
+                vocab_terms[term_lower] = entry
+            continue
+            
+        kw_field = entry.get('keywords', '')
+        if isinstance(kw_field, str):
+            terms = [t.strip() for t in kw_field.split(',')]
+        else:
+            terms = [str(t) for t in kw_field]
+        
+        for term in terms:
+            term_lower = term.lower().strip()
+            if term_lower and len(term_lower) >= 2:
+                vocab_terms[term_lower] = term
+                # Also index without underscores/hyphens
+                normalized = term_lower.replace('_', ' ').replace('-', ' ')
+                if normalized != term_lower:
+                    vocab_terms[normalized] = term
+    
+    # Match vocabulary terms (prefer longer matches)
+    for term_lower, term_orig in sorted(vocab_terms.items(), key=lambda x: -len(x[0])):
+        if term_lower in query_lower and term_lower not in seen:
+            keywords.append((term_orig, 'vocab'))
+            seen.add(term_lower)
+            # Also mark component words as seen to avoid duplicates
+            for word in term_lower.split():
+                seen.add(word)
+    
+    # Match knowledge graph nodes
+    if knowledge_graph:
+        for node_id, node in knowledge_graph.nodes.items():
+            label = node.get('label', node_id)
+            label_lower = label.lower()
+            
+            # Skip if already matched
+            if label_lower in seen or node_id in seen:
+                continue
+            
+            # Check if term appears in query
+            if label_lower in query_lower or node_id.replace('_', ' ') in query_lower:
+                keywords.append((label, 'kg'))
+                seen.add(label_lower)
+                seen.add(node_id)
+    
+    return keywords
+
+
+def decompose_query(query: str,
+                    vocabulary: list,
+                    knowledge_graph: Optional[KnowledgeGraph] = None,
+                    min_keywords: int = 2,
+                    max_subqueries: int = 4) -> List[str]:
+    """
+    Decompose a long query into focused sub-queries based on domain keywords.
+    
+    Strategy:
+    1. Extract domain keywords from the query
+    2. Group related keywords (using knowledge graph co-occurrence)
+    3. Create sub-queries for each group
+    4. Fall back to original query if not enough keywords found
+    
+    Args:
+        query: Original search query
+        vocabulary: Vocabulary entries for keyword extraction
+        knowledge_graph: Optional KG for grouping related terms
+        min_keywords: Minimum keywords needed to decompose (default: 2)
+        max_subqueries: Maximum number of sub-queries to generate (default: 4)
+        
+    Returns:
+        List of sub-query strings. Returns [query] if decomposition not warranted.
+        
+    Example:
+        query = "How does OFAC screening work and how are wire transfers validated with BIC?"
+        returns = ["OFAC screening sanctions", "wire transfers BIC validation"]
+    """
+    # Extract domain keywords
+    keywords = extract_domain_keywords(query, vocabulary, knowledge_graph)
+    
+    # Not enough keywords to decompose
+    if len(keywords) < min_keywords:
+        return [query]
+    
+    # Short query doesn't need decomposition
+    word_count = len(query.split())
+    if word_count <= 5:
+        return [query]
+    
+    # Group related keywords using knowledge graph
+    keyword_groups = []
+    used_keywords = set()
+    
+    if knowledge_graph:
+        # Find clusters of related keywords
+        for kw, source in keywords:
+            if kw.lower() in used_keywords:
+                continue
+            
+            # Start a new group with this keyword
+            group = [kw]
+            used_keywords.add(kw.lower())
+            
+            # Find related keywords from the same query
+            kw_node = knowledge_graph.get_node(kw)
+            if kw_node:
+                co_occurs = kw_node.get('co_occurs_with', [])
+                related_terms = set(t.lower() for t in co_occurs)
+                
+                # Add related keywords to this group
+                for other_kw, _ in keywords:
+                    if other_kw.lower() in used_keywords:
+                        continue
+                    if other_kw.lower() in related_terms:
+                        group.append(other_kw)
+                        used_keywords.add(other_kw.lower())
+            
+            keyword_groups.append(group)
+    else:
+        # Without KG, each keyword is its own group
+        for kw, source in keywords:
+            if kw.lower() not in used_keywords:
+                keyword_groups.append([kw])
+                used_keywords.add(kw.lower())
+    
+    # Limit number of groups
+    keyword_groups = keyword_groups[:max_subqueries]
+    
+    # Create sub-queries from groups
+    sub_queries = []
+    for group in keyword_groups:
+        if len(group) == 1:
+            # Single keyword - just use the keyword (cleaner)
+            sub_queries.append(group[0])
+        else:
+            # Multiple related keywords - combine them
+            sub_queries.append(' '.join(group))
+    
+    # If we only got one sub-query, return original only
+    if len(sub_queries) <= 1:
+        return [query]
+    
+    # CRITICAL: Include original query FIRST to preserve context/relationships
+    # Then add focused sub-queries for concept boosting
+    # RRF will combine: original (context) + focused (precision)
+    return [query] + sub_queries
+
+
+def search_decomposed(pipeline: IndexingPipeline,
+                      query: str,
+                      vocabulary: list,
+                      top_k: int = 5,
+                      source_type: str = "all",
+                      verbose: bool = False,
+                      knowledge_graph: Optional[KnowledgeGraph] = None,
+                      expand_query: bool = False,
+                      tfidf_boost: bool = False,
+                      show_related: bool = True) -> list:
+    """
+    Search using query decomposition for long queries.
+    
+    Decomposes the query into focused sub-queries, runs each separately,
+    then combines results using Reciprocal Rank Fusion (RRF).
+    
+    Benefits:
+    - Each sub-query focuses on one concept
+    - Results from multiple perspectives are combined
+    - Documents matching multiple concepts rank higher
+    
+    Args:
+        pipeline: The indexing pipeline
+        query: Original search query
+        vocabulary: Vocabulary for keyword extraction
+        top_k: Number of final results
+        source_type: Filter by source type
+        verbose: Show detailed output
+        knowledge_graph: Optional KG for expansion/boosting
+        expand_query: Enable query expansion
+        tfidf_boost: Enable TF-IDF boosting
+        show_related: Show related terms in results
+        
+    Returns:
+        List of search results
+    """
+    from unified_indexer.index import reciprocal_rank_fusion
+    
+    # Decompose query into sub-queries
+    sub_queries = decompose_query(query, vocabulary, knowledge_graph)
+    
+    # If no decomposition, use regular search
+    if len(sub_queries) == 1:
+        return search_once(pipeline, query, top_k, source_type, verbose,
+                          knowledge_graph, expand_query, tfidf_boost, show_related)
+    
+    # Parse source type filter
+    source_types = None
+    if source_type == "code":
+        source_types = [SourceType.CODE]
+    elif source_type == "document":
+        source_types = [SourceType.DOCUMENT]
+    elif source_type == "log":
+        source_types = [SourceType.LOG]
+    
+    print(f"\n🔎 Query decomposition:")
+    print(f"   Original: \"{query}\"")
+    print(f"   Sub-queries ({len(sub_queries)}):")
+    for i, sq in enumerate(sub_queries, 1):
+        print(f"      {i}. \"{sq}\"")
+    
+    # Run each sub-query
+    all_results = []  # List of (chunk_id, score) lists for RRF
+    chunk_lookup = {}  # chunk_id -> SearchResult (keep best)
+    
+    for sq in sub_queries:
+        # Expand sub-query if enabled
+        search_sq = sq
+        if knowledge_graph and expand_query:
+            search_sq = knowledge_graph.expand_query(sq)
+        
+        # Search
+        fetch_k = top_k * 2  # Fetch extra for fusion
+        results = pipeline.search(search_sq, top_k=fetch_k, source_types=source_types)
+        
+        # Apply TF-IDF boost if enabled
+        if knowledge_graph and tfidf_boost and results:
+            results = apply_tfidf_boost(results, knowledge_graph, sq)
+        
+        # Collect for RRF
+        result_tuples = []
+        for r in results:
+            chunk_id = r.chunk.chunk_id
+            result_tuples.append((chunk_id, r.combined_score))
+            
+            # Keep the result with highest score for each chunk
+            if chunk_id not in chunk_lookup or r.combined_score > chunk_lookup[chunk_id].combined_score:
+                chunk_lookup[chunk_id] = r
+        
+        all_results.append(result_tuples)
+        
+        if verbose:
+            print(f"\n   Sub-query \"{sq}\": {len(results)} results")
+    
+    # Fuse results using RRF
+    if not all_results or not any(all_results):
+        print("\n⚠️  No results found.")
+        return []
+    
+    fused_scores = reciprocal_rank_fusion(all_results, k=60)
+    
+    # Build final result list
+    final_results = []
+    for chunk_id, rrf_score in sorted(fused_scores.items(), key=lambda x: -x[1]):
+        if chunk_id in chunk_lookup:
+            result = chunk_lookup[chunk_id]
+            # Update combined_score to RRF score for display
+            result.combined_score = rrf_score
+            final_results.append(result)
+    
+    final_results = final_results[:top_k]
+    
+    # Assign ranks
+    for i, result in enumerate(final_results):
+        result.rank = i + 1
+    
+    # Display results
+    print(f"\n{'═' * 60}")
+    print(f"Found {len(final_results)} result(s) (fused from {len(sub_queries)} sub-queries)")
+    print(f"{'═' * 60}")
+    
+    for i, result in enumerate(final_results):
+        print_result(result, i, verbose, knowledge_graph, show_related)
+    
+    print(f"\n{'═' * 60}")
+    
+    return final_results
 
 
 def search_and_analyze(pipeline: IndexingPipeline,
@@ -804,6 +1498,177 @@ def search_and_analyze(pipeline: IndexingPipeline,
     return results, response
 
 
+def search_and_analyze_decomposed(pipeline: IndexingPipeline,
+                                   query: str,
+                                   vocabulary: list,
+                                   provider: 'LLMProvider',
+                                   top_k: int = 20,
+                                   source_type: str = "all",
+                                   min_score: float = 0.50,
+                                   verbose: bool = False,
+                                   knowledge_graph: Optional[KnowledgeGraph] = None,
+                                   expand_query: bool = False,
+                                   tfidf_boost: bool = False):
+    """
+    Search with query decomposition and analyze with LLM.
+    
+    Unlike regular search_and_analyze, this:
+    1. Decomposes the query into sub-queries
+    2. Searches each sub-query separately
+    3. Sends ALL results to LLM organized by sub-query
+    4. LLM can see results from each perspective and synthesize
+    
+    This is better for complex multi-concept queries because the LLM
+    can understand relationships between concepts that RRF fusion cannot.
+    
+    Args:
+        pipeline: The indexing pipeline
+        query: Original search query
+        vocabulary: Vocabulary for keyword extraction
+        provider: LLM provider for analysis
+        top_k: Results per sub-query
+        source_type: Filter by source type
+        min_score: Minimum score threshold
+        verbose: Show detailed output
+        knowledge_graph: Optional KG for expansion
+        expand_query: Enable query expansion
+        tfidf_boost: Enable TF-IDF boosting
+    """
+    # Parse source type
+    source_types = None
+    if source_type == "code":
+        source_types = [SourceType.CODE]
+    elif source_type == "document":
+        source_types = [SourceType.DOCUMENT]
+    elif source_type == "log":
+        source_types = [SourceType.LOG]
+    
+    # Decompose query
+    sub_queries = decompose_query(query, vocabulary, knowledge_graph)
+    
+    # If no decomposition, fall back to regular search_and_analyze
+    if len(sub_queries) == 1:
+        return search_and_analyze(pipeline, query, provider, top_k, source_type,
+                                  min_score, verbose, knowledge_graph, 
+                                  expand_query, tfidf_boost)
+    
+    print(f"\n🔎 Query decomposition for LLM analysis:")
+    print(f"   Original: \"{query}\"")
+    print(f"   Sub-queries ({len(sub_queries)}):")
+    for i, sq in enumerate(sub_queries, 1):
+        label = "(full context)" if i == 1 else "(focused)"
+        print(f"      {i}. \"{sq}\" {label}")
+    
+    # Search each sub-query and collect results
+    results_by_subquery = {}  # sub_query -> list of results
+    all_chunks_seen = set()   # Track unique chunks
+    
+    for sq in sub_queries:
+        # Expand if enabled
+        search_sq = sq
+        if knowledge_graph and expand_query:
+            search_sq = knowledge_graph.expand_query(sq)
+        
+        # Search
+        results = pipeline.search(search_sq, top_k=top_k, source_types=source_types)
+        
+        # Apply TF-IDF boost
+        if knowledge_graph and tfidf_boost and results:
+            results = apply_tfidf_boost(results, knowledge_graph, sq)
+        
+        # Filter by score and dedupe
+        filtered = []
+        for r in results:
+            if r.combined_score >= min_score:
+                chunk_id = r.chunk.chunk_id
+                if chunk_id not in all_chunks_seen:
+                    filtered.append(r)
+                    all_chunks_seen.add(chunk_id)
+        
+        results_by_subquery[sq] = filtered
+        
+        if verbose:
+            print(f"\n   Sub-query \"{sq}\": {len(filtered)} results (score >= {min_score})")
+    
+    # Show summary
+    total_results = sum(len(r) for r in results_by_subquery.values())
+    print(f"\n📊 Total unique results: {total_results} across {len(sub_queries)} sub-queries")
+    
+    if verbose:
+        for sq, results in results_by_subquery.items():
+            print(f"\n   [{sq}]")
+            for i, r in enumerate(results[:3]):
+                chunk = r.chunk
+                proc = chunk.metadata.get('procedure_name') or chunk.metadata.get('function_name') or ''
+                source = Path(chunk.source_ref.file_path or 'unknown').name
+                print(f"      {i+1}. [{r.combined_score:.3f}] {proc or source}")
+    
+    # Build LLM prompt with results organized by sub-query
+    print(f"\n🤖 Sending to LLM for analysis...")
+    
+    context_parts = []
+    context_parts.append(f"Original Question: {query}\n")
+    context_parts.append(f"The query was decomposed into {len(sub_queries)} search perspectives:\n")
+    
+    for i, (sq, results) in enumerate(results_by_subquery.items(), 1):
+        if i == 1:
+            context_parts.append(f"\n=== Perspective {i}: Full Context Search ===")
+            context_parts.append(f"Query: \"{sq}\"\n")
+        else:
+            context_parts.append(f"\n=== Perspective {i}: Focused on '{sq}' ===")
+        
+        if not results:
+            context_parts.append("No relevant results found.\n")
+            continue
+        
+        for j, r in enumerate(results[:5], 1):  # Top 5 per sub-query
+            chunk = r.chunk
+            proc = chunk.metadata.get('procedure_name') or chunk.metadata.get('function_name')
+            source = chunk.source_ref.file_path or 'unknown'
+            
+            context_parts.append(f"\n--- Result {i}.{j} [{r.combined_score:.3f}] ---")
+            context_parts.append(f"Source: {source}")
+            if proc:
+                context_parts.append(f"Procedure: {proc}")
+            context_parts.append(f"Content:\n{chunk.text[:1500]}")
+            if len(chunk.text) > 1500:
+                context_parts.append("... (truncated)")
+    
+    context = "\n".join(context_parts)
+    
+    # Create analysis prompt
+    prompt = f"""Analyze the following search results to answer the user's question.
+
+The results are organized by search perspective - the first perspective searched the full query
+for context, while subsequent perspectives focused on specific concepts mentioned in the query.
+
+Use information from ALL perspectives to provide a comprehensive answer.
+Cite specific procedures, files, or sections when referencing the code/documentation.
+
+{context}
+
+---
+
+Based on these results from multiple search perspectives, please provide:
+1. A direct answer to the question: "{query}"
+2. Key relevant procedures/functions found
+3. Any important relationships between the concepts searched
+4. Suggestions for further exploration if the answer is incomplete
+"""
+    
+    # Call LLM
+    response = provider.complete(prompt)
+    
+    print_llm_analysis(response, verbose)
+    
+    # Return flattened results for compatibility
+    all_results = []
+    for results in results_by_subquery.values():
+        all_results.extend(results)
+    
+    return all_results, response
+
+
 
 def search_by_capability(pipeline: IndexingPipeline,
                          capability: str,
@@ -835,7 +1700,8 @@ def interactive_mode(pipeline: IndexingPipeline,
                      provider: 'LLMProvider' = None,
                      min_score: float = 0.50,
                      verbose: bool = False,
-                     knowledge_graph: Optional[KnowledgeGraph] = None):
+                     knowledge_graph: Optional[KnowledgeGraph] = None,
+                     vocabulary: list = None):
     """
     Run interactive search mode with optional knowledge graph support.
     
@@ -845,6 +1711,7 @@ def interactive_mode(pipeline: IndexingPipeline,
         min_score: Minimum score for LLM analysis
         verbose: Verbose output mode
         knowledge_graph: Optional knowledge graph for query expansion/boosting
+        vocabulary: Vocabulary list for query decomposition
     """
     print("\n" + "=" * 60)
     print("INTERACTIVE SEARCH MODE")
@@ -857,6 +1724,7 @@ def interactive_mode(pipeline: IndexingPipeline,
     expand_query = True if knowledge_graph else False
     tfidf_boost = True if knowledge_graph else False
     show_related = True if knowledge_graph else False
+    decompose_queries = True if (vocabulary and knowledge_graph) else False
     
     print(f"""
 Commands:
@@ -874,6 +1742,7 @@ Knowledge Graph ({kg_status}):
   :expand           Toggle query expansion (current: {'ON' if expand_query else 'OFF'})
   :boost            Toggle TF-IDF boosting (current: {'ON' if tfidf_boost else 'OFF'})
   :related          Toggle related terms display (current: {'ON' if show_related else 'OFF'})
+  :decompose        Toggle query decomposition for long queries (current: {'ON' if decompose_queries else 'OFF'})
   :lookup <term>    Look up term in knowledge graph
   :graph            Show knowledge graph stats
   
@@ -956,6 +1825,15 @@ Commands:
             else:
                 print("❌ Knowledge graph not loaded. Use --knowledge-graph option.")
         
+        elif query.lower() == ":decompose":
+            if knowledge_graph and vocabulary:
+                decompose_queries = not decompose_queries
+                print(f"Query decomposition: {'ON' if decompose_queries else 'OFF'}")
+                if decompose_queries:
+                    print("   Long queries will be split into focused sub-queries")
+            else:
+                print("❌ Requires knowledge graph and vocabulary. Use --knowledge-graph option.")
+        
         elif query.lower().startswith(":lookup "):
             term = query[8:].strip()
             if knowledge_graph:
@@ -1026,11 +1904,20 @@ Commands:
             if not provider:
                 print("❌ LLM analysis not available. Set ANTHROPIC_API_KEY or OPENAI_API_KEY")
             else:
-                search_and_analyze(pipeline, q, provider, top_k=20, 
-                                   min_score=min_score, verbose=verbose,
-                                   knowledge_graph=knowledge_graph,
-                                   expand_query=expand_query,
-                                   tfidf_boost=tfidf_boost)
+                if decompose_queries and vocabulary:
+                    # Use decomposed search for LLM - sends results from each sub-query
+                    search_and_analyze_decomposed(pipeline, q, vocabulary, provider, 
+                                                  top_k=20, min_score=min_score, 
+                                                  verbose=verbose,
+                                                  knowledge_graph=knowledge_graph,
+                                                  expand_query=expand_query,
+                                                  tfidf_boost=tfidf_boost)
+                else:
+                    search_and_analyze(pipeline, q, provider, top_k=20, 
+                                       min_score=min_score, verbose=verbose,
+                                       knowledge_graph=knowledge_graph,
+                                       expand_query=expand_query,
+                                       tfidf_boost=tfidf_boost)
         
         elif query.lower().startswith(":cap "):
             capability = query[5:].strip()
@@ -1038,29 +1925,50 @@ Commands:
         
         elif query.lower().startswith(":code "):
             q = query[6:].strip()
-            search_once(pipeline, q, top_k, "code", verbose,
-                       knowledge_graph=knowledge_graph,
-                       expand_query=expand_query,
-                       tfidf_boost=tfidf_boost,
-                       show_related=show_related)
+            if decompose_queries and vocabulary:
+                search_decomposed(pipeline, q, vocabulary, top_k, "code", verbose,
+                                 knowledge_graph=knowledge_graph,
+                                 expand_query=expand_query,
+                                 tfidf_boost=tfidf_boost,
+                                 show_related=show_related)
+            else:
+                search_once(pipeline, q, top_k, "code", verbose,
+                           knowledge_graph=knowledge_graph,
+                           expand_query=expand_query,
+                           tfidf_boost=tfidf_boost,
+                           show_related=show_related)
         
         elif query.lower().startswith(":doc "):
             q = query[5:].strip()
-            search_once(pipeline, q, top_k, "document", verbose,
-                       knowledge_graph=knowledge_graph,
-                       expand_query=expand_query,
-                       tfidf_boost=tfidf_boost,
-                       show_related=show_related)
+            if decompose_queries and vocabulary:
+                search_decomposed(pipeline, q, vocabulary, top_k, "document", verbose,
+                                 knowledge_graph=knowledge_graph,
+                                 expand_query=expand_query,
+                                 tfidf_boost=tfidf_boost,
+                                 show_related=show_related)
+            else:
+                search_once(pipeline, q, top_k, "document", verbose,
+                           knowledge_graph=knowledge_graph,
+                           expand_query=expand_query,
+                           tfidf_boost=tfidf_boost,
+                           show_related=show_related)
         
         elif query.startswith(":"):
             print(f"Unknown command: {query}. Type :help for available commands.")
         
         else:
-            search_once(pipeline, query, top_k, "all", verbose,
-                       knowledge_graph=knowledge_graph,
-                       expand_query=expand_query,
-                       tfidf_boost=tfidf_boost,
-                       show_related=show_related)
+            if decompose_queries and vocabulary:
+                search_decomposed(pipeline, query, vocabulary, top_k, "all", verbose,
+                                 knowledge_graph=knowledge_graph,
+                                 expand_query=expand_query,
+                                 tfidf_boost=tfidf_boost,
+                                 show_related=show_related)
+            else:
+                search_once(pipeline, query, top_k, "all", verbose,
+                           knowledge_graph=knowledge_graph,
+                           expand_query=expand_query,
+                           tfidf_boost=tfidf_boost,
+                           show_related=show_related)
 
 
 def main():
@@ -1140,8 +2048,12 @@ Interactive commands for knowledge graph:
                         help="Expand query using related terms from knowledge graph")
     parser.add_argument("--tfidf-boost", "-b", action="store_true",
                         help="Boost scores based on TF-IDF (distinctive terms)")
+    parser.add_argument("--decompose", "-d", action="store_true",
+                        help="Decompose long queries into focused sub-queries")
     parser.add_argument("--no-related", action="store_true",
                         help="Don't show related terms in results")
+    parser.add_argument("--no-kg", action="store_true",
+                        help="Don't auto-load embedded knowledge graph from index")
     
     args = parser.parse_args()
     
@@ -1175,17 +2087,35 @@ Interactive commands for knowledge graph:
     total_chunks = stats['pipeline']['total_chunks']
     print(f"Index loaded: {total_chunks} chunks")
     
-    # Load knowledge graph if provided
+    # Load knowledge graph
+    # Priority: 1) explicit --knowledge-graph flag, 2) embedded in index directory
+    # Skip if --no-kg flag is set
     knowledge_graph = None
-    if args.knowledge_graph:
-        knowledge_graph = load_knowledge_graph(args.knowledge_graph)
-        if knowledge_graph and (args.expand_query or args.tfidf_boost):
-            features = []
-            if args.expand_query:
-                features.append("query expansion")
-            if args.tfidf_boost:
-                features.append("TF-IDF boost")
-            print(f"   Features enabled: {', '.join(features)}")
+    kg_source = None
+    
+    if not args.no_kg:
+        if args.knowledge_graph:
+            # Explicit path provided
+            knowledge_graph = load_knowledge_graph(args.knowledge_graph)
+            kg_source = args.knowledge_graph
+        else:
+            # Check for embedded knowledge graph in index directory
+            embedded_kg_path = os.path.join(args.index, "knowledge_graph.json")
+            if os.path.exists(embedded_kg_path):
+                knowledge_graph = load_knowledge_graph(embedded_kg_path)
+                kg_source = "embedded in index"
+        
+        if knowledge_graph:
+            if kg_source == "embedded in index":
+                print(f"📊 Knowledge graph: auto-loaded from index")
+            
+            if args.expand_query or args.tfidf_boost:
+                features = []
+                if args.expand_query:
+                    features.append("query expansion")
+                if args.tfidf_boost:
+                    features.append("TF-IDF boost")
+                print(f"   Features enabled: {', '.join(features)}")
     
     # Determine show_related setting
     show_related = not args.no_related
@@ -1207,19 +2137,32 @@ Interactive commands for knowledge graph:
     # Run search
     if args.interactive:
         interactive_mode(pipeline, llm_provider, args.min_score, args.verbose, 
-                        knowledge_graph)
+                        knowledge_graph, vocabulary=vocab_data)
     elif args.analyze and args.query:
         if llm_provider:
-            search_and_analyze(
-                pipeline, args.query, llm_provider,
-                top_k=20,
-                source_type=args.type,
-                min_score=args.min_score,
-                verbose=args.verbose,
-                knowledge_graph=knowledge_graph,
-                expand_query=args.expand_query,
-                tfidf_boost=args.tfidf_boost
-            )
+            if args.decompose and knowledge_graph:
+                # Use decomposed search - sends results from each sub-query to LLM
+                search_and_analyze_decomposed(
+                    pipeline, args.query, vocab_data, llm_provider,
+                    top_k=20,
+                    source_type=args.type,
+                    min_score=args.min_score,
+                    verbose=args.verbose,
+                    knowledge_graph=knowledge_graph,
+                    expand_query=args.expand_query,
+                    tfidf_boost=args.tfidf_boost
+                )
+            else:
+                search_and_analyze(
+                    pipeline, args.query, llm_provider,
+                    top_k=20,
+                    source_type=args.type,
+                    min_score=args.min_score,
+                    verbose=args.verbose,
+                    knowledge_graph=knowledge_graph,
+                    expand_query=args.expand_query,
+                    tfidf_boost=args.tfidf_boost
+                )
         else:
             print("❌ LLM analysis requires a valid provider. Check API keys.")
             search_once(pipeline, args.query, args.top, args.type, args.verbose,
@@ -1230,11 +2173,20 @@ Interactive commands for knowledge graph:
     elif args.capability:
         search_by_capability(pipeline, args.capability, args.top, args.verbose)
     else:
-        search_once(pipeline, args.query, args.top, args.type, args.verbose,
-                   knowledge_graph=knowledge_graph,
-                   expand_query=args.expand_query,
-                   tfidf_boost=args.tfidf_boost,
-                   show_related=show_related)
+        # Use decomposition for long queries if enabled
+        if args.decompose and knowledge_graph:
+            search_decomposed(pipeline, args.query, vocab_data, args.top, args.type, 
+                             args.verbose,
+                             knowledge_graph=knowledge_graph,
+                             expand_query=args.expand_query,
+                             tfidf_boost=args.tfidf_boost,
+                             show_related=show_related)
+        else:
+            search_once(pipeline, args.query, args.top, args.type, args.verbose,
+                       knowledge_graph=knowledge_graph,
+                       expand_query=args.expand_query,
+                       tfidf_boost=args.tfidf_boost,
+                       show_related=show_related)
 
 
 if __name__ == "__main__":
