@@ -15,32 +15,32 @@ ARCHITECTURE & CLASS DESIGN
 ================================================================================
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           KNOWLEDGE EXTRACTOR                                │
+│                           KNOWLEDGE EXTRACTOR                               │
 │                                                                             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────────────┐ │
-│  │    PDFs     │    │    Code     │    │        KnowledgeExtractor       │ │
-│  │  (Business) │    │  (Technical)│    │                                 │ │
-│  └──────┬──────┘    └──────┬──────┘    │  • pdf_terms: Dict[str, Term]   │ │
-│         │                  │           │  • code_terms: Dict[str, Term]  │ │
-│         ▼                  ▼           │  • merged_terms: Dict[str, Term]│ │
-│  ┌──────────────┐   ┌──────────────┐   │  • relationships: List[Rel]     │ │
-│  │ LLM Extract  │   │ Pattern Match│   │  • document_term_sets: List     │ │
-│  │ (top 30/doc) │   │ (domain only)│   │                                 │ │
-│  └──────┬───────┘   └──────┬───────┘   └─────────────────────────────────┘ │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────────────┐  │
+│  │    PDFs     │    │    Code     │    │        KnowledgeExtractor       │  │
+│  │  (Business) │    │  (Technical)│    │                                 │  │
+│  └──────┬──────┘    └──────┬──────┘    │  • pdf_terms: Dict[str, Term]   │  │
+│         │                  │           │  • code_terms: Dict[str, Term]  │  │
+│         ▼                  ▼           │  • merged_terms: Dict[str, Term]│  │
+│  ┌──────────────┐   ┌──────────────┐   │  • relationships: List[Rel]     │  │
+│  │ LLM Extract  │   │ Pattern Match│   │  • document_term_sets: List     │  │
+│  │ (top 30/doc) │   │ (domain only)│   │                                 │  │
+│  └──────┬───────┘   └──────┬───────┘   └─────────────────────────────────┘  │
 │         │                  │                                                │
 │         └────────┬─────────┘                                                │
 │                  ▼                                                          │
 │         ┌───────────────────┐                                               │
-│         │  Cross-Reference  │  ◄─── Merge terms, boost confidence          │
-│         │  & TF-IDF Calc    │       for terms in BOTH sources              │
+│         │  Cross-Reference  │  ◄─── Merge terms, boost confidence           │
+│         │  & TF-IDF Calc    │       for terms in BOTH sources               │
 │         └─────────┬─────────┘                                               │
 │                   │                                                         │
 │     ┌─────────────┼─────────────┐                                           │
 │     ▼             ▼             ▼                                           │
-│ ┌────────┐  ┌──────────┐  ┌──────────┐                                     │
-│ │ Vocab  │  │ Knowledge│  │ TF-IDF   │                                     │
-│ │ .json  │  │ Graph    │  │ Stats    │                                     │
-│ └────────┘  └──────────┘  └──────────┘                                     │
+│ ┌────────┐  ┌──────────┐  ┌──────────┐                                      │
+│ │ Vocab  │  │ Knowledge│  │ TF-IDF   │                                      │
+│ │ .json  │  │ Graph    │  │ Stats    │                                      │
+│ └────────┘  └──────────┘  └──────────┘                                      │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ================================================================================
