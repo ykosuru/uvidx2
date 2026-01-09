@@ -172,7 +172,8 @@ class SourceReference:
             'section_title': self.section_title,
             'timestamp': self.timestamp,
             'trace_id': self.trace_id,
-            'transaction_id': self.transaction_id
+            'transaction_id': self.transaction_id,
+            'domain': self.domain if self.domain != 'default' else None
         }.items() if v is not None}
     
     def __str__(self) -> str:
