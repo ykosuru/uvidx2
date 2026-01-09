@@ -1850,7 +1850,7 @@ Examples:
         if not query:
             continue
         
-        if query.lower() in [":quit", ":exit", ":q"]:
+        if query.lower() in [":quit", ":exit", ":q", "quit", "exit", "q"]:
             print("Goodbye!")
             break
         
@@ -2157,8 +2157,8 @@ Interactive commands for knowledge graph:
     args = parser.parse_args()
     
     # Validate
-    if not args.interactive and not args.query and not args.capability:
-        print("Error: Either --query, --capability, or --interactive is required")
+    if not args.interactive and not args.query and not args.capability and not args.list_domains:
+        print("Error: Either --query, --capability, --interactive, or --list-domains is required")
         sys.exit(1)
     
     if not os.path.exists(args.index):
