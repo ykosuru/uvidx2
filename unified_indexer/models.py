@@ -158,12 +158,36 @@ class SourceReference:
     trace_id: Optional[str] = None
     transaction_id: Optional[str] = None
     
-    # Domain tag for logical separation
-    domain: str = "default"
+    # Domain tags for logical separation (supports multiple domains)
+    domains: List[str] = field(default_factory=lambda: ["default"])
+    
+    @property
+    def domain(self) -> str:
+        """Primary domain (first in list) - for backward compatibility"""
+        return self.domains[0] if self.domains else "default"
+    
+    @domain.setter
+    def domain(self, value):
+        """Set domain(s) - accepts string or list"""
+        if isinstance(value, str):
+            # Parse comma-separated domains
+            self.domains = [d.strip() for d in value.split(',') if d.strip()]
+        elif isinstance(value, list):
+            self.domains = value if value else ["default"]
+        else:
+            self.domains = ["default"]
+    
+    def has_domain(self, domain: str) -> bool:
+        """Check if this reference belongs to a domain"""
+        return domain in self.domains
+    
+    def has_any_domain(self, domains: List[str]) -> bool:
+        """Check if this reference belongs to any of the given domains"""
+        return any(d in self.domains for d in domains)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization"""
-        return {k: v for k, v in {
+        result = {k: v for k, v in {
             'file_path': self.file_path,
             'line_start': self.line_start,
             'line_end': self.line_end,
@@ -173,8 +197,39 @@ class SourceReference:
             'timestamp': self.timestamp,
             'trace_id': self.trace_id,
             'transaction_id': self.transaction_id,
-            'domain': self.domain if self.domain != 'default' else None
         }.items() if v is not None}
+        
+        # Save domains if not just default
+        if self.domains and self.domains != ["default"]:
+            result['domains'] = self.domains
+        
+        return result
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'SourceReference':
+        """Reconstruct from dictionary with backward compatibility"""
+        # Handle backward compatibility: old format had 'domain' as string
+        domains = data.get('domains')
+        if domains is None:
+            # Check for old 'domain' field
+            old_domain = data.get('domain')
+            if old_domain:
+                domains = [old_domain] if isinstance(old_domain, str) else old_domain
+            else:
+                domains = ["default"]
+        
+        return cls(
+            file_path=data['file_path'],
+            line_start=data.get('line_start'),
+            line_end=data.get('line_end'),
+            procedure_name=data.get('procedure_name'),
+            page_number=data.get('page_number'),
+            section_title=data.get('section_title'),
+            timestamp=data.get('timestamp'),
+            trace_id=data.get('trace_id'),
+            transaction_id=data.get('transaction_id'),
+            domains=domains
+        )
     
     def __str__(self) -> str:
         """Human-readable source reference"""
@@ -272,7 +327,7 @@ class IndexableChunk:
             embedding_text=data['embedding_text'],
             source_type=SourceType(data['source_type']),
             semantic_type=SemanticType(data['semantic_type']),
-            source_ref=SourceReference(**data['source_ref']),
+            source_ref=SourceReference.from_dict(data['source_ref']),
             domain_matches=[DomainMatch(**m) for m in data.get('domain_matches', [])],
             context_before=data.get('context_before'),
             context_after=data.get('context_after'),
