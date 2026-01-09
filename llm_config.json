@@ -1,0 +1,29 @@
+{
+    "default_profile": "internal",
+    
+    "profiles": {
+        "internal": {
+            "model": "gpt-4",
+            "base_url": "http://localhost:8000",
+            "api_key_env": "INTERNAL_API_KEY"
+        },
+        
+        "openai": {
+            "model": "gpt-4-turbo",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY"
+        },
+        
+        "anthropic": {
+            "model": "claude-3-sonnet",
+            "base_url": "https://api.anthropic.com/v1",
+            "api_key_env": "ANTHROPIC_API_KEY"
+        },
+        
+        "local": {
+            "model": "llama-3-8b",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": null
+        }
+    }
+}
