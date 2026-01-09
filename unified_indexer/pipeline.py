@@ -264,15 +264,18 @@ class IndexingPipeline:
             # Parse file
             chunks = parser.parse_file(file_path)
             
-            # Tag chunks with domain and index
+            # Tag chunks with domain(s) and index
             for chunk in chunks:
-                chunk.source_ref.domain = domain
+                chunk.source_ref.domain = domain  # Setter handles comma-separated
                 self.index.index_chunk(chunk)
             
-            # Track domain statistics
+            # Track domain statistics (for each domain in the list)
             if not hasattr(self, 'domain_stats'):
                 self.domain_stats = {}
-            self.domain_stats[domain] = self.domain_stats.get(domain, 0) + len(chunks)
+            # Parse domains the same way the setter does
+            domain_list = [d.strip() for d in domain.split(',') if d.strip()] if isinstance(domain, str) else domain
+            for d in domain_list:
+                self.domain_stats[d] = self.domain_stats.get(d, 0) + len(chunks)
             
             processing_time = (time.time() - start_time) * 1000
             
@@ -444,14 +447,16 @@ class IndexingPipeline:
         chunks = parser.parse(content, source_path)
         
         for chunk in chunks:
-            # Tag with domain
+            # Tag with domain(s) - setter handles comma-separated
             chunk.source_ref.domain = domain
             self.index.index_chunk(chunk)
         
-        # Track domain statistics
+        # Track domain statistics (for each domain in the list)
         if not hasattr(self, 'domain_stats'):
             self.domain_stats = {}
-        self.domain_stats[domain] = self.domain_stats.get(domain, 0) + len(chunks)
+        domain_list = [d.strip() for d in domain.split(',') if d.strip()] if isinstance(domain, str) else domain
+        for d in domain_list:
+            self.domain_stats[d] = self.domain_stats.get(d, 0) + len(chunks)
         
         # Update statistics
         if chunks:
@@ -499,7 +504,7 @@ class IndexingPipeline:
         
         # Filter by domains if specified
         if domains:
-            results = [r for r in results if r.chunk.source_ref.domain in domains]
+            results = [r for r in results if r.chunk.source_ref.has_any_domain(domains)]
         
         return results[:top_k]
     
@@ -517,13 +522,25 @@ class IndexingPipeline:
             chunks_dict = getattr(self.index, 'bm25_index', None)
             if chunks_dict and hasattr(chunks_dict, 'chunks'):
                 for chunk_id, chunk in chunks_dict.chunks.items():
-                    domain = getattr(chunk.source_ref, 'domain', 'default')
-                    self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
+                    # Handle multi-domain chunks
+                    domains = getattr(chunk.source_ref, 'domains', None)
+                    if domains:
+                        for domain in domains:
+                            self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
+                    else:
+                        # Fallback to single domain property
+                        domain = getattr(chunk.source_ref, 'domain', 'default')
+                        self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
             # Fallback: try concept_index
             elif hasattr(self.index, 'concept_index') and hasattr(self.index.concept_index, 'chunks'):
                 for chunk_id, chunk in self.index.concept_index.chunks.items():
-                    domain = getattr(chunk.source_ref, 'domain', 'default')
-                    self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
+                    domains = getattr(chunk.source_ref, 'domains', None)
+                    if domains:
+                        for domain in domains:
+                            self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
+                    else:
+                        domain = getattr(chunk.source_ref, 'domain', 'default')
+                        self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
         return self.domain_stats.copy()
     
     def search_cross_reference(self,
