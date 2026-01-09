@@ -510,12 +510,20 @@ class IndexingPipeline:
         Returns:
             Dict mapping domain name to chunk count
         """
-        if not hasattr(self, 'domain_stats'):
+        if not hasattr(self, 'domain_stats') or not self.domain_stats:
             # Build from index if not tracked
             self.domain_stats = {}
-            for chunk in self.index.chunks:
-                domain = chunk.source_ref.domain
-                self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
+            # Access chunks through bm25_index which stores them as dict
+            chunks_dict = getattr(self.index, 'bm25_index', None)
+            if chunks_dict and hasattr(chunks_dict, 'chunks'):
+                for chunk_id, chunk in chunks_dict.chunks.items():
+                    domain = getattr(chunk.source_ref, 'domain', 'default')
+                    self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
+            # Fallback: try concept_index
+            elif hasattr(self.index, 'concept_index') and hasattr(self.index.concept_index, 'chunks'):
+                for chunk_id, chunk in self.index.concept_index.chunks.items():
+                    domain = getattr(chunk.source_ref, 'domain', 'default')
+                    self.domain_stats[domain] = self.domain_stats.get(domain, 0) + 1
         return self.domain_stats.copy()
     
     def search_cross_reference(self,
