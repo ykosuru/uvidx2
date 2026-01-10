@@ -1,0 +1,100 @@
+{
+  "name": "astra-code-search",
+  "displayName": "Astra Code Search",
+  "description": "Search legacy code and documentation using @astra in Copilot Chat",
+  "version": "1.0.0",
+  "publisher": "your-publisher-name",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "keywords": [
+    "copilot",
+    "chat",
+    "search",
+    "code",
+    "astra"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "astra.search",
+        "fullName": "Astra Code Search",
+        "name": "astra",
+        "description": "Search legacy TAL/COBOL code and documentation",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "search",
+            "description": "Search for code and documentation"
+          },
+          {
+            "name": "context",
+            "description": "Get context for a development task"
+          },
+          {
+            "name": "procedure",
+            "description": "Find a specific procedure by name"
+          },
+          {
+            "name": "domains",
+            "description": "List available domains"
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "Astra Code Search",
+      "properties": {
+        "astra.indexPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the unified indexer index directory"
+        },
+        "astra.apiUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "URL of the Astra API server"
+        },
+        "astra.defaultDomains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Default domains to search (empty = all)"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "astra.startServer",
+        "title": "Astra: Start API Server"
+      },
+      {
+        "command": "astra.setIndex",
+        "title": "Astra: Set Index Path"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  }
+}
