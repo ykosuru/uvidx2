@@ -1,0 +1,40 @@
+{
+  "name": "astra-code-search",
+  "displayName": "Astra Code Search",
+  "description": "Search legacy code and documentation using @astra in Copilot Chat",
+  "version": "1.0.0",
+  "publisher": "astra",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["AI", "Chat"],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "astra.search",
+        "fullName": "Astra Code Search",
+        "name": "astra",
+        "description": "Search legacy TAL/COBOL code and documentation",
+        "isSticky": true
+      }
+    ],
+    "configuration": {
+      "title": "Astra Code Search",
+      "properties": {
+        "astra.apiUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "URL of the Astra API server"
+        },
+        "astra.defaultDomains": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Default domains to search"
+        }
+      }
+    }
+  }
+}
