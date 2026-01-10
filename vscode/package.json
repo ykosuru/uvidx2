@@ -89,12 +89,12 @@
     "package": "vsce package"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "@types/vscode": "^1.85.0",
-    "typescript": "^5.3.0",
-    "@vscode/vsce": "^2.22.0"
+    "@types/node": "18.x",
+    "@types/vscode": "1.85.0",
+    "typescript": "5.0.4",
+    "@vscode/vsce": "2.22.0"
   },
   "dependencies": {
-    "axios": "^1.6.0"
+    "axios": "1.6.0"
   }
 }
